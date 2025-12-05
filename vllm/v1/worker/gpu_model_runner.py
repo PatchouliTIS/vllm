@@ -615,6 +615,32 @@ class GPUModelRunner(
             pin_memory=self.pin_memory,
         )
 
+        # GPU-side tensors for async scheduling with speculative decoding.
+        # These enable GPU-side correction of positions/seq_lens/slot_mapping
+        # without requiring GPU->CPU synchronization.
+        self.use_gpu_input_correction = (
+            self.use_async_scheduling and self.num_spec_tokens > 0
+        )
+        if self.use_gpu_input_correction:
+            # Cached valid_sampled_token_count from the previous step (on GPU)
+            self.cached_valid_sampled_token_count_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            # Cached prev_num_draft_len from the previous step (on GPU)
+            self.cached_prev_num_draft_len_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            # Mapping from current batch index to previous batch index
+            # -1 means new request (no previous state)
+            self.curr_to_prev_idx_gpu = torch.full(
+                (self.max_num_reqs,), -1, dtype=torch.int32, device=self.device
+            )
+            self.curr_to_prev_idx_cpu = torch.full(
+                (self.max_num_reqs,), -1, dtype=torch.int32, pin_memory=self.pin_memory
+            )
+            # Number of requests in the previous batch (for bounds checking)
+            self.prev_num_reqs: int = 0
+
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
         self.kv_connector_output: KVConnectorOutput | None = None
@@ -883,9 +909,23 @@ class GPUModelRunner(
         is_last_rank = get_pp_group().is_last_rank
         req_data = scheduler_output.scheduled_cached_reqs
 
-        # Wait until valid_sampled_tokens_count is copied to cpu,
-        # then use it to update actual num_computed_tokens of each request.
-        valid_sampled_token_count = self._get_valid_sampled_token_count()
+        # When using GPU input correction, we skip the CPU sync here and
+        # instead correct the GPU tensors directly after _prepare_inputs.
+        # The CPU state (req_state.num_computed_tokens, output_token_ids)
+        # will be updated in bookkeeping after model forward.
+        #
+        # Key insight: In async scheduling + spec decode, input_ids are filled
+        # via scatter from prev_sampled_token_ids and _draft_token_ids, which
+        # does NOT depend on num_computed_tokens. Only positions, seq_lens,
+        # and slot_mapping need to be corrected on GPU.
+        use_gpu_correction = self.use_gpu_input_correction
+
+        if not use_gpu_correction:
+            # Original path: wait for valid_sampled_token_count to be copied to CPU
+            valid_sampled_token_count = self._get_valid_sampled_token_count()
+        else:
+            # GPU correction path: skip CPU sync, use empty list
+            valid_sampled_token_count = []
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -911,7 +951,14 @@ class GPUModelRunner(
             if req_state.prev_num_draft_len:
                 if req_index is None:
                     req_state.prev_num_draft_len = 0
+                elif use_gpu_correction:
+                    # GPU correction path: skip CPU-side num_computed_tokens update
+                    # The correction will happen on GPU after _prepare_inputs.
+                    # We still need to update output_token_ids placeholder later
+                    # in bookkeeping.
+                    pass
                 else:
+                    # Original path: CPU-side correction
                     assert self.input_batch.prev_req_id_to_index is not None
                     prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
                     num_accepted = valid_sampled_token_count[prev_req_index] - 1
@@ -1062,6 +1109,12 @@ class GPUModelRunner(
                 "gpu_model_runner: update_ngram_gpu_tensors_incremental"
             ):
                 self._update_ngram_gpu_tensors_incremental(ngram_gpu_new_reqs)
+
+        # Build curr_to_prev_idx mapping for GPU input correction
+        # This must be done after condense/reorder but before we lose
+        # prev_req_id_to_index information
+        if use_gpu_correction:
+            self._build_curr_to_prev_idx_mapping(self.input_batch.num_reqs)
 
     def _update_ngram_gpu_tensors_incremental(
         self,
@@ -3139,6 +3192,52 @@ class GPUModelRunner(
                 scheduler_output, num_tokens_padded, intermediate_tensors
             )
 
+            print("In execute_model::preprocess before modify gpu input parameters:")
+            print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
+            print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
+            print(f"\t\tinput_ids: {input_ids}")
+            print(f"\t\tpositions: {positions}")
+            print(f"\t\tself.positions.gpu: {self.positions.gpu}")
+            print(f"\t\tseq_lens: {self.seq_lens.gpu}")
+            print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
+            print(f"\t\tnum_reqs: {num_reqs}")
+            for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
+                blk_table = self.input_batch.block_table[kv_cache_gid]
+                blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+                slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
+                print(
+                    f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}"
+                )
+                print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
+
+            # Apply GPU-side correction for positions, seq_lens, and slot_mapping
+            # when using async scheduling with speculative decoding.
+            # This corrects for rejected tokens from the previous step without
+            # requiring GPU->CPU synchronization.
+            #
+            # Key insight: input_ids do NOT need correction because in async
+            # scheduling, they are filled via scatter from prev_sampled_token_ids
+            # and _draft_token_ids, which don't depend on num_computed_tokens.
+            # Only positions, seq_lens, and slot_mapping need GPU correction.
+            if self.use_gpu_input_correction:
+                # Get the block table for the first KV cache group (main attention)
+                # For models with multiple KV cache groups, we correct all of them
+                for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
+                    blk_table = self.input_batch.block_table[kv_cache_gid]
+                    blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+                    slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
+
+                    self._correct_inputs_on_gpu(
+                        positions=positions
+                        if not self.uses_mrope and self.uses_xdrope_dim <= 0
+                        else self.positions.gpu,
+                        seq_lens=self.seq_lens.gpu,
+                        slot_mapping=slot_mapping,
+                        query_start_loc=self.query_start_loc.gpu,
+                        block_table=blk_table_tensor,
+                        num_reqs=num_reqs,
+                    )
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -3146,6 +3245,23 @@ class GPUModelRunner(
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
+
+        print("In execute_model::model_forward input parameters:")
+        print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
+        print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
+        print(f"\t\tinput_ids: {input_ids}")
+        print(f"\t\tpositions: {positions}")
+        print(f"\t\tself.positions.gpu: {self.positions.gpu}")
+        print(f"\t\tseq_lens: {self.seq_lens.gpu}")
+        print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
+        print(f"\t\tnum_reqs: {num_reqs}")
+        for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
+            blk_table = self.input_batch.block_table[kv_cache_gid]
+            blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+            slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
+            print(f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}")
+            print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
+        print("----------------------------------------------------------")
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -3348,9 +3464,20 @@ class GPUModelRunner(
                         self.discard_request_mask.gpu,
                     )
                 )
-                self._copy_valid_sampled_token_count(
-                    next_token_ids, valid_sampled_tokens_count
-                )
+                if self.use_gpu_input_correction:
+                    # Cache on GPU for next step's correction
+                    self._cache_valid_sampled_token_count_gpu(
+                        valid_sampled_tokens_count,
+                        next_token_ids,
+                        next_token_ids.shape[0],
+                    )
+                    # When input_fits_in_drafter=False, no draft tokens are generated
+                    # so we cache None (which results in draft_len=0)
+                    self._cache_prev_num_draft_len_gpu(None, next_token_ids.shape[0])
+                else:
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
 
         if use_padded_batch_for_ngram:
             assert self.speculative_config is not None
@@ -3369,9 +3496,20 @@ class GPUModelRunner(
                         self.discard_request_mask.gpu,
                     )
                 )
-                self._copy_valid_sampled_token_count(
-                    next_token_ids, valid_sampled_tokens_count
-                )
+                if self.use_gpu_input_correction:
+                    # Cache on GPU for next step's correction
+                    self._cache_valid_sampled_token_count_gpu(
+                        valid_sampled_tokens_count,
+                        next_token_ids,
+                        next_token_ids.shape[0],
+                    )
+                    # When input_fits_in_drafter=False, no draft tokens are generated
+                    # so we cache None (which results in draft_len=0)
+                    self._cache_prev_num_draft_len_gpu(None, next_token_ids.shape[0])
+                else:
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
@@ -3488,6 +3626,278 @@ class GPUModelRunner(
         self.valid_sampled_token_count_event.synchronize()
         return counts_cpu[: prev_sampled_token_ids.shape[0]].tolist()
 
+    def _correct_inputs_on_gpu(
+        self,
+        positions: torch.Tensor,
+        seq_lens: torch.Tensor,
+        slot_mapping: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        block_table: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """
+        Correct positions, seq_lens, and slot_mapping in-place on GPU based on
+        the cached valid_sampled_token_count from the previous step.
+
+        This avoids the GPU->CPU synchronization that would otherwise be needed
+        to update these tensors based on rejected speculative tokens.
+
+        Why input_ids don't need correction:
+        In async scheduling + spec decode, input_ids are filled via scatter from
+        prev_sampled_token_ids (for the target model's sampled token) and
+        _draft_token_ids (for draft tokens). These scatter operations use indices
+        computed from cu_num_tokens and draft_len, which come from the scheduler
+        and are already correct. The scatter indices don't depend on
+        num_computed_tokens, so input_ids don't need correction.
+
+        What needs correction:
+        - positions: computed as num_computed_tokens + arange, need -= num_rejected
+        - seq_lens: computed as num_computed_tokens + num_scheduled_tokens,
+                    need -= num_rejected
+        - slot_mapping: depends on positions, need recalculation
+
+        Args:
+            positions: [total_tokens] position tensor to correct
+            seq_lens: [num_reqs] sequence lengths to correct
+            slot_mapping: [total_tokens] slot mapping to recalculate
+            query_start_loc: [num_reqs + 1] cumulative token counts
+            block_table: [num_reqs, max_num_blocks_per_req] block table
+            num_reqs: number of requests in current batch
+        """
+        print(
+            f"[_correct_inputs_on_gpu] num_reqs={num_reqs}, prev_num_reqs={self.prev_num_reqs}"
+        )
+        if num_reqs == 0 or self.prev_num_reqs == 0:
+            print(
+                f"[_correct_inputs_on_gpu] Early return: num_reqs={num_reqs}, prev_num_reqs={self.prev_num_reqs}"
+            )
+            return
+
+        # Get the mapping and cached values
+        curr_to_prev = self.curr_to_prev_idx_gpu[:num_reqs]
+        valid_counts = self.cached_valid_sampled_token_count_gpu
+        prev_draft_lens = self.cached_prev_num_draft_len_gpu
+
+        print(f"[_correct_inputs_on_gpu] curr_to_prev={curr_to_prev}")
+        print(
+            f"[_correct_inputs_on_gpu] valid_counts[:num_reqs]={valid_counts[:num_reqs]}"
+        )
+        print(
+            f"[_correct_inputs_on_gpu] prev_draft_lens[:num_reqs]={prev_draft_lens[:num_reqs]}"
+        )
+
+        # Find requests that need correction (have valid previous index)
+        has_prev = curr_to_prev >= 0  # [num_reqs]
+
+        if not has_prev.any():
+            print(
+                "[_correct_inputs_on_gpu] Early return: no requests have previous index"
+            )
+            return
+
+        # Gather previous draft lengths and valid counts for current requests
+        # Use clamp to handle -1 indices (will be masked out anyway)
+        prev_indices_safe = curr_to_prev.clamp(min=0).long()
+        prev_draft_len = prev_draft_lens[prev_indices_safe]  # [num_reqs]
+        valid_count = valid_counts[prev_indices_safe]  # [num_reqs]
+
+        # Calculate num_rejected for each request
+        # num_accepted = valid_count - 1
+        # num_rejected = prev_draft_len - num_accepted
+        #              = prev_draft_len - valid_count + 1
+        num_rejected = (prev_draft_len - valid_count + 1).clamp(min=0)
+
+        print(f"[_correct_inputs_on_gpu] prev_draft_len={prev_draft_len}")
+        print(f"[_correct_inputs_on_gpu] valid_count={valid_count}")
+        print(f"[_correct_inputs_on_gpu] num_rejected={num_rejected}")
+
+        # Only correct requests with prev_draft_len > 0 and valid previous index
+        needs_correction = has_prev & (prev_draft_len > 0) & (num_rejected > 0)
+
+        print(f"[_correct_inputs_on_gpu] needs_correction={needs_correction}")
+
+        if not needs_correction.any():
+            print("[_correct_inputs_on_gpu] Early return: no requests need correction")
+            return
+
+        # Correct seq_lens: seq_lens[i] -= num_rejected[i]
+        # Only modify the first num_reqs elements
+        correction = num_rejected * needs_correction.int()
+        print(f"[_correct_inputs_on_gpu] correction={correction}")
+        print(
+            f"[_correct_inputs_on_gpu] BEFORE seq_lens[:num_reqs]={seq_lens[:num_reqs]}"
+        )
+        seq_lens[:num_reqs].sub_(correction)
+        print(
+            f"[_correct_inputs_on_gpu] AFTER seq_lens[:num_reqs]={seq_lens[:num_reqs]}"
+        )
+
+        # For positions and slot_mapping, we need to iterate per request
+        # because each request has different token ranges
+        # Use vectorized approach: expand num_rejected to token level
+
+        # Get token ranges for each request
+        # query_start_loc is [num_reqs + 1], giving cumulative counts
+        token_starts = query_start_loc[:num_reqs]
+        token_ends = query_start_loc[1 : num_reqs + 1]
+        total_tokens = int(token_ends[-1].item()) if num_reqs > 0 else 0
+
+        if total_tokens == 0:
+            return
+
+        # Create a mapping from token index to request index using vectorized ops
+        # token_to_req[t] = request index that token t belongs to
+        # Use searchsorted to find which request each token belongs to
+        token_indices = torch.arange(total_tokens, device=self.device)
+        # searchsorted returns the index where token_indices would be inserted
+        # in token_ends to maintain sorted order, which gives us req_idx + 1
+        # for tokens in request req_idx (since token_ends[req_idx] is exclusive)
+        token_to_req = torch.searchsorted(token_ends, token_indices, right=True)
+
+        # Get num_rejected for each token (only for tokens that need correction)
+        # correction_per_req already has 0 for requests that don't need correction
+        correction_per_token = correction[token_to_req]  # [total_tokens]
+
+        # Correct positions: positions[t] -= num_rejected for that token's request
+        print(
+            f"[_correct_inputs_on_gpu] BEFORE positions[:total_tokens]={positions[:total_tokens]}"
+        )
+        print(f"[_correct_inputs_on_gpu] correction_per_token={correction_per_token}")
+        positions[:total_tokens].sub_(correction_per_token)
+        print(
+            f"[_correct_inputs_on_gpu] AFTER positions[:total_tokens]={positions[:total_tokens]}"
+        )
+
+        # Recalculate slot_mapping based on corrected positions
+        # slot_mapping = block_table[req, pos // block_size] * block_size + pos % block_size
+        corrected_positions = positions[:total_tokens]
+        block_size = self.cache_config.block_size
+        max_num_blocks = block_table.shape[1]
+
+        block_idx = corrected_positions // block_size
+        block_table_indices = token_to_req.long() * max_num_blocks + block_idx.long()
+        block_numbers = block_table.view(-1)[block_table_indices]
+        block_offsets = corrected_positions % block_size
+        slot_mapping[:total_tokens] = block_numbers * block_size + block_offsets
+
+    def _cache_valid_sampled_token_count_gpu(
+        self,
+        valid_sampled_tokens_count: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        num_reqs: int,
+    ) -> None:
+        """
+        Cache valid_sampled_token_count on GPU for use in the next step's
+        input correction, instead of copying to CPU.
+
+        Args:
+            valid_sampled_tokens_count: [num_reqs] valid token counts from current step
+            next_token_ids: [num_reqs] next token ids (used for prev_sampled_token_ids)
+            num_reqs: number of requests
+        """
+        if not self.use_gpu_input_correction:
+            return
+
+        print(f"[_cache_valid_sampled_token_count_gpu] num_reqs={num_reqs}")
+        print(
+            f"[_cache_valid_sampled_token_count_gpu] valid_sampled_tokens_count[:num_reqs]={valid_sampled_tokens_count[:num_reqs]}"
+        )
+
+        # Cache the valid counts on GPU
+        self.cached_valid_sampled_token_count_gpu[:num_reqs].copy_(
+            valid_sampled_tokens_count[:num_reqs]
+        )
+
+        # Also update prev_sampled_token_ids for async scheduling
+        self.input_batch.prev_sampled_token_ids = next_token_ids.unsqueeze(1)
+
+    def _build_curr_to_prev_idx_mapping(self, num_reqs: int) -> None:
+        """
+        Build the mapping from current batch indices to previous batch indices.
+        This is called during _update_states before the batch is modified.
+
+        For each request in the current batch, find its index in the previous batch.
+        New requests get -1.
+        """
+        if not self.use_gpu_input_correction:
+            return
+
+        prev_req_id_to_index = self.input_batch.prev_req_id_to_index
+        if prev_req_id_to_index is None:
+            # First iteration, no previous batch
+            self.curr_to_prev_idx_cpu[:num_reqs].fill_(-1)
+            print(
+                "[_build_curr_to_prev_idx_mapping] First iteration, no previous batch"
+            )
+        else:
+            for curr_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+                prev_idx = prev_req_id_to_index.get(req_id, -1)
+                self.curr_to_prev_idx_cpu[curr_idx] = prev_idx
+
+        print(f"[_build_curr_to_prev_idx_mapping] num_reqs={num_reqs}")
+        print(
+            f"[_build_curr_to_prev_idx_mapping] curr_to_prev_idx_cpu[:num_reqs]={self.curr_to_prev_idx_cpu[:num_reqs]}"
+        )
+
+        # Copy to GPU (non-blocking, will be synchronized before use)
+        self.curr_to_prev_idx_gpu[:num_reqs].copy_(
+            self.curr_to_prev_idx_cpu[:num_reqs], non_blocking=True
+        )
+
+    def _cache_prev_num_draft_len_gpu(
+        self,
+        draft_token_ids: torch.Tensor | list[list[int]] | None,
+        num_reqs: int,
+    ) -> None:
+        """
+        Cache the number of draft tokens for each request in the current step.
+        This will be used in the next step to calculate num_rejected.
+
+        Args:
+            draft_token_ids: The draft tokens produced in the current step.
+                Can be a tensor of shape [num_reqs, num_spec_tokens] or list of lists.
+                If None, draft_len is 0 for all requests.
+            num_reqs: Number of requests in current batch.
+        """
+        if not self.use_gpu_input_correction:
+            return
+
+        # Reset to zero
+        self.cached_prev_num_draft_len_gpu[:num_reqs].zero_()
+
+        if draft_token_ids is not None:
+            if isinstance(draft_token_ids, torch.Tensor):
+                # For tensor format: count non-padding tokens per row
+                # Assuming -1 or similar padding value for invalid tokens
+                # The tensor shape is [num_reqs, num_spec_tokens]
+                # Count valid (non-negative) tokens per request
+                valid_mask = draft_token_ids >= 0
+                draft_lens = valid_mask.sum(dim=1).to(torch.int32)
+                self.cached_prev_num_draft_len_gpu[:num_reqs].copy_(
+                    draft_lens[:num_reqs]
+                )
+            else:
+                # For list format
+                for req_idx, tokens in enumerate(draft_token_ids):
+                    if req_idx < num_reqs:
+                        self.cached_prev_num_draft_len_gpu[req_idx] = len(tokens)
+
+        print(f"[_cache_prev_num_draft_len_gpu] num_reqs={num_reqs}")
+        print(
+            f"[_cache_prev_num_draft_len_gpu] draft_token_ids type={type(draft_token_ids)}"
+        )
+        if isinstance(draft_token_ids, torch.Tensor):
+            print(
+                f"[_cache_prev_num_draft_len_gpu] draft_token_ids shape={draft_token_ids.shape}"
+            )
+            print(f"[_cache_prev_num_draft_len_gpu] draft_token_ids={draft_token_ids}")
+        print(
+            f"[_cache_prev_num_draft_len_gpu] cached_prev_num_draft_len_gpu[:num_reqs]={self.cached_prev_num_draft_len_gpu[:num_reqs]}"
+        )
+
+        # Save current num_reqs for next iteration
+        self.prev_num_reqs = num_reqs
+
     def propose_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3532,9 +3942,19 @@ class GPUModelRunner(
                 self.num_tokens_no_spec_gpu,
                 self.discard_request_mask.gpu,
             )
-            self._copy_valid_sampled_token_count(
-                next_token_ids, valid_sampled_tokens_count
-            )
+            if self.use_gpu_input_correction:
+                # Cache on GPU for next step's correction
+                self._cache_valid_sampled_token_count_gpu(
+                    valid_sampled_tokens_count,
+                    next_token_ids,
+                    next_token_ids.shape[0],
+                )
+                # NOTE: _cache_prev_num_draft_len_gpu is called AFTER propose()
+                # because we need the actual draft_token_ids produced by the drafter
+            else:
+                self._copy_valid_sampled_token_count(
+                    next_token_ids, valid_sampled_tokens_count
+                )
 
             batch_size = next_token_ids.shape[0]
             max_new_tokens = valid_sampled_token_ids_gpu.shape[1]  # num_spec_tokens + 1
@@ -3584,6 +4004,10 @@ class GPUModelRunner(
             )
             # Cache is_empty_draft_tokens for filtering in _update_states
             self._is_empty_draft_tokens = is_empty_draft_tokens
+
+            # Now cache prev_num_draft_len using the actual draft_token_ids
+            if self.use_gpu_input_correction:
+                self._cache_prev_num_draft_len_gpu(draft_token_ids, batch_size)
         elif spec_config.method == "suffix":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, SuffixDecodingProposer)
@@ -3648,9 +4072,19 @@ class GPUModelRunner(
                         self.discard_request_mask.gpu,
                     )
                 )
-                self._copy_valid_sampled_token_count(
-                    next_token_ids, valid_sampled_tokens_count
-                )
+                if self.use_gpu_input_correction:
+                    # Cache on GPU for next step's correction
+                    self._cache_valid_sampled_token_count_gpu(
+                        valid_sampled_tokens_count,
+                        next_token_ids,
+                        next_token_ids.shape[0],
+                    )
+                    # NOTE: _cache_prev_num_draft_len_gpu is called at the end
+                    # of this function after propose() produces draft_token_ids
+                else:
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
 
             if spec_decode_metadata is None:
                 token_indices_to_sample = None
@@ -3719,6 +4153,12 @@ class GPUModelRunner(
                 common_attn_metadata=common_attn_metadata,
                 mm_embed_inputs=mm_embed_inputs,
             )
+
+            # Cache prev_num_draft_len using the actual draft_token_ids
+            if self.use_gpu_input_correction:
+                self._cache_prev_num_draft_len_gpu(
+                    draft_token_ids, next_token_ids.shape[0]
+                )
 
         return draft_token_ids
 
