@@ -593,6 +593,11 @@ class GPUModelRunner(
         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
         # For ngram_gpu: indicates which requests have empty/invalid draft tokens
         self._is_empty_draft_tokens: torch.Tensor | None = None
+        # Pre-allocated pinned CPU tensor for batch copying _is_empty_draft_tokens
+        # to avoid per-request DtoH synchronization in _update_states
+        self._is_empty_draft_tokens_cpu = torch.empty(
+            self.max_num_reqs, dtype=torch.bool, pin_memory=self.pin_memory
+        )
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -619,15 +624,25 @@ class GPUModelRunner(
         # These enable GPU-side correction of positions/seq_lens/slot_mapping
         # without requiring GPU->CPU synchronization.
         self.use_gpu_input_correction = (
-            self.use_async_scheduling and self.num_spec_tokens > 0
+            True and self.use_async_scheduling and self.num_spec_tokens > 0
         )
         if self.use_gpu_input_correction:
             # Cached valid_sampled_token_count from the previous step (on GPU)
             self.cached_valid_sampled_token_count_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
-            # Cached prev_num_draft_len from the previous step (on GPU)
+            # Cached prev_num_draft_len from the previous step (on GPU).
+            # We use double buffering: prev_prev_num_draft_len_gpu holds the value
+            # from the previous step (for correction), while
+            # cached_prev_num_draft_len_gpu is updated in the current step.
             self.cached_prev_num_draft_len_gpu = torch.zeros(
+                self.max_num_reqs, dtype=torch.int32, device=self.device
+            )
+            # prev_prev_num_draft_len_gpu holds the prev_num_draft_len from the
+            # step BEFORE the current step. This is used by _correct_inputs_on_gpu
+            # because the correction uses the scheduler_output from the previous
+            # step, not the current step.
+            self.prev_prev_num_draft_len_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
             # Mapping from current batch index to previous batch index
@@ -640,6 +655,14 @@ class GPUModelRunner(
             )
             # Number of requests in the previous batch (for bounds checking)
             self.prev_num_reqs: int = 0
+            # Pre-allocated pinned memory for batch updating cached_prev_num_draft_len_gpu
+            # to avoid per-request HtoD synchronization in _update_states
+            self._update_draft_len_indices_cpu = torch.empty(
+                self.max_num_reqs, dtype=torch.int64, pin_memory=self.pin_memory
+            )
+            self._update_draft_len_values_cpu = torch.empty(
+                self.max_num_reqs, dtype=torch.int32, pin_memory=self.pin_memory
+            )
 
         # Ephemeral state transferred between execute_model() and sample_tokens().
         self.execute_model_state: ExecuteModelState | None = None
@@ -797,44 +820,60 @@ class GPUModelRunner(
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        # Remove finished requests from the cached states.
-        for req_id in scheduler_output.finished_req_ids:
-            self.requests.pop(req_id, None)
-            self.num_prompt_logprobs.pop(req_id, None)
-        # Remove the finished requests from the persistent batch.
-        # NOTE(woosuk): There could be an edge case where finished_req_ids and
-        # scheduled_req_ids overlap. This happens when a request is aborted and
-        # then resubmitted with the same ID. In this case, we treat them as two
-        # distinct requests - clearing the cached states for the first request
-        # and handling the second as a new request.
-        for req_id in scheduler_output.finished_req_ids:
-            self.input_batch.remove_request(req_id)
+        # For GPU correction: swap the double buffers.
+        # prev_prev_num_draft_len_gpu now holds the values from the previous step
+        # (which will be used by _correct_inputs_on_gpu), and
+        # cached_prev_num_draft_len_gpu will be updated with this step's values.
+        if self.use_gpu_input_correction:
+            with record_function_or_nullcontext("_update_states:: _swap_prev_prev_num_draft_len_gpu"):
+                (
+                    self.prev_prev_num_draft_len_gpu,
+                    self.cached_prev_num_draft_len_gpu,
+                ) = (
+                    self.cached_prev_num_draft_len_gpu,
+                    self.prev_prev_num_draft_len_gpu,
+                )
 
-        # Free the cached encoder outputs.
-        for mm_hash in scheduler_output.free_encoder_mm_hashes:
-            self.encoder_cache.pop(mm_hash, None)
+        with record_function_or_nullcontext("_update_states:: common part 1"):
+            # Remove finished requests from the cached states.
+            for req_id in scheduler_output.finished_req_ids:
+                self.requests.pop(req_id, None)
+                self.num_prompt_logprobs.pop(req_id, None)
+            # Remove the finished requests from the persistent batch.
+            # NOTE(woosuk): There could be an edge case where finished_req_ids and
+            # scheduled_req_ids overlap. This happens when a request is aborted and
+            # then resubmitted with the same ID. In this case, we treat them as two
+            # distinct requests - clearing the cached states for the first request
+            # and handling the second as a new request.
+            for req_id in scheduler_output.finished_req_ids:
+                self.input_batch.remove_request(req_id)
 
-        # Remove the unscheduled requests from the persistent batch.
-        # NOTE(woosuk): The unscheduled requests are either preempted requests
-        # or running requests that are not scheduled in this step. We remove
-        # them from the persistent batch but keep their cached states since
-        # they will be scheduled again sometime in the future.
-        scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
-        cached_req_ids = self.input_batch.req_id_to_index.keys()
-        resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
-        # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
-        # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
-        # apart from the forced-preemption case in reset_prefix_cache. And in
-        # that case we include the resumed_req_ids in the unscheduled set so
-        # that they get cleared from the persistent batch before being re-scheduled
-        # in the normal resumed request path.
-        unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
-        # NOTE(woosuk): The persistent batch optimization assumes that
-        # consecutive batches contain mostly the same requests. If batches
-        # have low request overlap (e.g., alternating between two distinct
-        # sets of requests), this optimization becomes very inefficient.
-        for req_id in unscheduled_req_ids:
-            self.input_batch.remove_request(req_id)
+            # Free the cached encoder outputs.
+            for mm_hash in scheduler_output.free_encoder_mm_hashes:
+                self.encoder_cache.pop(mm_hash, None)
+
+            # Remove the unscheduled requests from the persistent batch.
+            # NOTE(woosuk): The unscheduled requests are either preempted requests
+            # or running requests that are not scheduled in this step. We remove
+            # them from the persistent batch but keep their cached states since
+            # they will be scheduled again sometime in the future.
+            scheduled_req_ids = scheduler_output.num_scheduled_tokens.keys()
+            cached_req_ids = self.input_batch.req_id_to_index.keys()
+            resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
+            # NOTE(zhuohan): cached_req_ids and resumed_req_ids are usually disjoint,
+            # so `(scheduled_req_ids - resumed_req_ids) == scheduled_req_ids` holds
+            # apart from the forced-preemption case in reset_prefix_cache. And in
+            # that case we include the resumed_req_ids in the unscheduled set so
+            # that they get cleared from the persistent batch before being re-scheduled
+            # in the normal resumed request path.
+            unscheduled_req_ids = cached_req_ids - (scheduled_req_ids - resumed_req_ids)
+            # NOTE(woosuk): The persistent batch optimization assumes that
+            # consecutive batches contain mostly the same requests. If batches
+            # have low request overlap (e.g., alternating between two distinct
+            # sets of requests), this optimization becomes very inefficient.
+            for req_id in unscheduled_req_ids:
+                self.input_batch.remove_request(req_id)
+
 
         # Check if ngram_gpu mode is enabled for incremental GPU tensor updates
         is_ngram_gpu = (
@@ -845,65 +884,66 @@ class GPUModelRunner(
         if is_ngram_gpu:
             ngram_gpu_new_reqs: list[CachedRequestState] = []
 
-        reqs_to_add: list[CachedRequestState] = []
-        # Add new requests to the cached states.
-        for new_req_data in scheduler_output.scheduled_new_reqs:
-            req_id = new_req_data.req_id
-            sampling_params = new_req_data.sampling_params
-            pooling_params = new_req_data.pooling_params
+        with record_function_or_nullcontext("_update_states:: add new requests"):
+            reqs_to_add: list[CachedRequestState] = []
+            # Add new requests to the cached states.
+            for new_req_data in scheduler_output.scheduled_new_reqs:
+                req_id = new_req_data.req_id
+                sampling_params = new_req_data.sampling_params
+                pooling_params = new_req_data.pooling_params
 
-            if (
-                sampling_params
-                and sampling_params.sampling_type == SamplingType.RANDOM_SEED
-            ):
-                generator = torch.Generator(device=self.device)
-                generator.manual_seed(sampling_params.seed)
-            else:
-                generator = None
+                if (
+                    sampling_params
+                    and sampling_params.sampling_type == SamplingType.RANDOM_SEED
+                ):
+                    generator = torch.Generator(device=self.device)
+                    generator.manual_seed(sampling_params.seed)
+                else:
+                    generator = None
 
-            if self.is_pooling_model:
-                assert pooling_params is not None
-                task = pooling_params.task
-                assert task is not None, "You did not set `task` in the API"
+                if self.is_pooling_model:
+                    assert pooling_params is not None
+                    task = pooling_params.task
+                    assert task is not None, "You did not set `task` in the API"
 
-                model = cast(VllmModelForPooling, self.get_model())
-                to_update = model.pooler.get_pooling_updates(task)
-                to_update.apply(pooling_params)
+                    model = cast(VllmModelForPooling, self.get_model())
+                    to_update = model.pooler.get_pooling_updates(task)
+                    to_update.apply(pooling_params)
 
-            req_state = CachedRequestState(
-                req_id=req_id,
-                prompt_token_ids=new_req_data.prompt_token_ids,
-                prompt_embeds=new_req_data.prompt_embeds,
-                mm_features=new_req_data.mm_features,
-                sampling_params=sampling_params,
-                pooling_params=pooling_params,
-                generator=generator,
-                block_ids=new_req_data.block_ids,
-                num_computed_tokens=new_req_data.num_computed_tokens,
-                output_token_ids=[],
-                lora_request=new_req_data.lora_request,
-            )
-            self.requests[req_id] = req_state
-
-            if sampling_params and sampling_params.prompt_logprobs is not None:
-                self.num_prompt_logprobs[req_id] = (
-                    self.input_batch.vocab_size
-                    if sampling_params.prompt_logprobs == -1
-                    else sampling_params.prompt_logprobs
+                req_state = CachedRequestState(
+                    req_id=req_id,
+                    prompt_token_ids=new_req_data.prompt_token_ids,
+                    prompt_embeds=new_req_data.prompt_embeds,
+                    mm_features=new_req_data.mm_features,
+                    sampling_params=sampling_params,
+                    pooling_params=pooling_params,
+                    generator=generator,
+                    block_ids=new_req_data.block_ids,
+                    num_computed_tokens=new_req_data.num_computed_tokens,
+                    output_token_ids=[],
+                    lora_request=new_req_data.lora_request,
                 )
+                self.requests[req_id] = req_state
 
-            # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
-            if self.uses_mrope:
-                self._init_mrope_positions(req_state)
+                if sampling_params and sampling_params.prompt_logprobs is not None:
+                    self.num_prompt_logprobs[req_id] = (
+                        self.input_batch.vocab_size
+                        if sampling_params.prompt_logprobs == -1
+                        else sampling_params.prompt_logprobs
+                    )
 
-            # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
-            if self.uses_xdrope_dim > 0:
-                self._init_xdrope_positions(req_state)
+                # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
+                if self.uses_mrope:
+                    self._init_mrope_positions(req_state)
 
-            reqs_to_add.append(req_state)
-            # Track new requests for ngram_gpu full tensor copy
-            if is_ngram_gpu:
-                ngram_gpu_new_reqs.append(req_state)
+                # Only relevant for models using XD-RoPE (e.g, HunYuan-VL)
+                if self.uses_xdrope_dim > 0:
+                    self._init_xdrope_positions(req_state)
+
+                reqs_to_add.append(req_state)
+                # Track new requests for ngram_gpu full tensor copy
+                if is_ngram_gpu:
+                    ngram_gpu_new_reqs.append(req_state)
 
         # Update the states of the running/resumed requests.
         is_last_rank = get_pp_group().is_last_rank
@@ -918,203 +958,264 @@ class GPUModelRunner(
         # via scatter from prev_sampled_token_ids and _draft_token_ids, which
         # does NOT depend on num_computed_tokens. Only positions, seq_lens,
         # and slot_mapping need to be corrected on GPU.
-        use_gpu_correction = self.use_gpu_input_correction
+        with record_function_or_nullcontext("_update_states:: update running/resumed requests"):
+            use_gpu_correction = self.use_gpu_input_correction
 
-        if not use_gpu_correction:
-            # Original path: wait for valid_sampled_token_count to be copied to CPU
-            valid_sampled_token_count = self._get_valid_sampled_token_count()
-        else:
-            # GPU correction path: skip CPU sync, use empty list
-            valid_sampled_token_count = []
-
-        for i, req_id in enumerate(req_data.req_ids):
-            req_state = self.requests[req_id]
-            num_computed_tokens = req_data.num_computed_tokens[i]
-            new_block_ids = req_data.new_block_ids[i]
-            resumed_from_preemption = req_id in req_data.resumed_req_ids
-            num_output_tokens = req_data.num_output_tokens[i]
-            req_index = self.input_batch.req_id_to_index.get(req_id)
-
-            # prev_num_draft_len is used in async scheduling mode with
-            # spec decode. it indicates if need to update num_computed_tokens
-            # of the request. for example:
-            # fist step: num_computed_tokens = 0, spec_tokens = [],
-            # prev_num_draft_len = 0.
-            # second step: num_computed_tokens = 100(prompt lenth),
-            # spec_tokens = [a,b], prev_num_draft_len = 0.
-            # third step: num_computed_tokens = 100 + 2, spec_tokens = [c,d],
-            # prev_num_draft_len = 2.
-            # num_computed_tokens in first step and second step does't contain
-            # the spec tokens length, but in third step it contains the
-            # spec tokens length. we only need to update num_computed_tokens
-            # when prev_num_draft_len > 0.
-            if req_state.prev_num_draft_len:
-                if req_index is None:
-                    req_state.prev_num_draft_len = 0
-                elif use_gpu_correction:
-                    # GPU correction path: skip CPU-side num_computed_tokens update
-                    # The correction will happen on GPU after _prepare_inputs.
-                    # We still need to update output_token_ids placeholder later
-                    # in bookkeeping.
-                    pass
+            with record_function_or_nullcontext("update running/resumed requests:: prepare valid_sampled_token_count"):
+                if not use_gpu_correction:
+                    # Original path: wait for valid_sampled_token_count to be copied to CPU
+                    valid_sampled_token_count = self._get_valid_sampled_token_count()
                 else:
-                    # Original path: CPU-side correction
-                    assert self.input_batch.prev_req_id_to_index is not None
-                    prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
-                    num_accepted = valid_sampled_token_count[prev_req_index] - 1
-                    num_rejected = req_state.prev_num_draft_len - num_accepted
-                    num_computed_tokens -= num_rejected
-                    req_state.output_token_ids.extend([-1] * num_accepted)
+                    # GPU correction path: skip CPU sync, use empty list
+                    valid_sampled_token_count = []
 
-            # Update the cached states.
-            req_state.num_computed_tokens = num_computed_tokens
-
-            if not is_last_rank:
-                # When using PP, the scheduler sends the sampled tokens back,
-                # because there's no direct communication between the first-
-                # stage worker and the last-stage worker.
-                new_token_ids = req_data.new_token_ids[i]
-                # Add the sampled token(s) from the previous step (if any).
-                # This doesn't include "unverified" tokens like spec tokens.
-                num_new_tokens = (
-                    num_computed_tokens + len(new_token_ids) - req_state.num_tokens
-                )
-                if num_new_tokens == 1:
-                    # Avoid slicing list in most common case.
-                    req_state.output_token_ids.append(new_token_ids[-1])
-                elif num_new_tokens > 0:
-                    req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
-            elif num_output_tokens < len(req_state.output_token_ids):
-                # Some output tokens were discarded due to a sync-KV-load
-                # failure. Align the cached state.
-                del req_state.output_token_ids[num_output_tokens:]
-                if req_index is not None:
-                    end_idx = (
-                        self.input_batch.num_prompt_tokens[req_index]
-                        + num_output_tokens
+            # Batch copy _is_empty_draft_tokens to CPU once before the loop
+            # to avoid per-request DtoH synchronization from .item() calls
+            with record_function_or_nullcontext("update running/resumed requests:: batch copy is_empty_draft_tokens"):
+                is_empty_draft_tokens_cpu: torch.Tensor | None = None
+                if self._is_empty_draft_tokens is not None:
+                    num_reqs_to_copy = min(
+                        len(req_data.req_ids),
+                        self._is_empty_draft_tokens.shape[0]
                     )
-                    self.input_batch.num_tokens[req_index] = end_idx
-                    self.input_batch.num_tokens_no_spec[req_index] = end_idx
+                    if num_reqs_to_copy > 0:
+                        self._is_empty_draft_tokens_cpu[:num_reqs_to_copy].copy_(
+                            self._is_empty_draft_tokens[:num_reqs_to_copy],
+                            non_blocking=True
+                        )
+                        # Synchronize once for the batch copy
+                        torch.cuda.current_stream().synchronize()
+                        is_empty_draft_tokens_cpu = self._is_empty_draft_tokens_cpu
 
-            # Update the block IDs.
-            if not resumed_from_preemption:
-                if new_block_ids is not None:
-                    # Append the new blocks to the existing block IDs.
-                    for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
-                        block_ids.extend(new_ids)
-            else:
-                assert req_index is None
-                assert new_block_ids is not None
-                # The request is resumed from preemption.
-                # Replace the existing block IDs with the new ones.
-                req_state.block_ids = new_block_ids
+            # Collect indices and values for batch updating cached_prev_num_draft_len_gpu
+            # to avoid per-request HtoD synchronization
+            draft_len_update_count = 0
 
-            if req_index is None:
-                # The request is not in the persistent batch.
-                # The request was either preempted and resumed later, or was not
-                # scheduled in the previous step and needs to be added again.
+            for i, req_id in enumerate(req_data.req_ids):
+                with record_function_or_nullcontext("update running/resumed requests:: process request"):
+                    req_state = self.requests[req_id]
+                    num_computed_tokens = req_data.num_computed_tokens[i]
+                    new_block_ids = req_data.new_block_ids[i]
+                    resumed_from_preemption = req_id in req_data.resumed_req_ids
+                    num_output_tokens = req_data.num_output_tokens[i]
+                    req_index = self.input_batch.req_id_to_index.get(req_id)
 
-                if self.use_async_scheduling and num_output_tokens > 0:
-                    # We must recover the output token ids for resumed requests in the
-                    # async scheduling case, so that correct input_ids are obtained.
-                    resumed_token_ids = req_data.all_token_ids[req_id]
-                    req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
+                # prev_num_draft_len is used in async scheduling mode with
+                # spec decode. it indicates if need to update num_computed_tokens
+                # of the request. for example:
+                # fist step: num_computed_tokens = 0, spec_tokens = [],
+                # prev_num_draft_len = 0.
+                # second step: num_computed_tokens = 100(prompt lenth),
+                # spec_tokens = [a,b], prev_num_draft_len = 0.
+                # third step: num_computed_tokens = 100 + 2, spec_tokens = [c,d],
+                # prev_num_draft_len = 2.
+                # num_computed_tokens in first step and second step does't contain
+                # the spec tokens length, but in third step it contains the
+                # spec tokens length. we only need to update num_computed_tokens
+                # when prev_num_draft_len > 0.
+                with record_function_or_nullcontext("update running/resumed requests:: update prev_num_draft_len"):
+                    if req_state.prev_num_draft_len:
+                        if req_index is None:
+                            req_state.prev_num_draft_len = 0
+                        elif use_gpu_correction:
+                            # GPU correction path: skip CPU-side num_computed_tokens update
+                            # The correction will happen on GPU after _prepare_inputs.
+                            # We still need to update output_token_ids placeholder later
+                            # in bookkeeping.
+                            pass
+                        else:
+                            # Original path: CPU-side correction
+                            assert self.input_batch.prev_req_id_to_index is not None
+                            prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
+                            num_accepted = valid_sampled_token_count[prev_req_index] - 1
+                            num_rejected = req_state.prev_num_draft_len - num_accepted
+                            num_computed_tokens -= num_rejected
+                            req_state.output_token_ids.extend([-1] * num_accepted)
 
-                reqs_to_add.append(req_state)
-                # Track resumed requests for ngram_gpu full tensor copy
-                if is_ngram_gpu:
-                    ngram_gpu_new_reqs.append(req_state)
-                continue
+                # Update the cached states.
+                with record_function_or_nullcontext("update running/resumed requests:: update num_computed_tokens"):
+                    req_state.num_computed_tokens = num_computed_tokens
 
-            # Update the persistent batch.
-            self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
-            if new_block_ids is not None:
-                self.input_batch.block_table.append_row(new_block_ids, req_index)
+                with record_function_or_nullcontext("update running/resumed requests:: update output_token_ids"):
+                    if not is_last_rank:
+                        # When using PP, the scheduler sends the sampled tokens back,
+                        # because there's no direct communication between the first-
+                        # stage worker and the last-stage worker.
+                        new_token_ids = req_data.new_token_ids[i]
+                        # Add the sampled token(s) from the previous step (if any).
+                        # This doesn't include "unverified" tokens like spec tokens.
+                        num_new_tokens = (
+                            num_computed_tokens + len(new_token_ids) - req_state.num_tokens
+                        )
+                        if num_new_tokens == 1:
+                            # Avoid slicing list in most common case.
+                            req_state.output_token_ids.append(new_token_ids[-1])
+                        elif num_new_tokens > 0:
+                            req_state.output_token_ids.extend(new_token_ids[-num_new_tokens:])
+                    elif num_output_tokens < len(req_state.output_token_ids):
+                        # Some output tokens were discarded due to a sync-KV-load
+                        # failure. Align the cached state.
+                        del req_state.output_token_ids[num_output_tokens:]
+                        if req_index is not None:
+                            end_idx = (
+                                self.input_batch.num_prompt_tokens[req_index]
+                                + num_output_tokens
+                            )
+                            self.input_batch.num_tokens[req_index] = end_idx
+                            self.input_batch.num_tokens_no_spec[req_index] = end_idx
 
-            # For the last rank, we don't need to update the token_ids_cpu
-            # because the sampled tokens are already cached.
-            if not is_last_rank:
-                # Add new_token_ids to token_ids_cpu.
-                start_token_index = num_computed_tokens
-                end_token_index = num_computed_tokens + len(new_token_ids)
-                self.input_batch.token_ids_cpu[
-                    req_index, start_token_index:end_token_index
-                ] = new_token_ids
-                self.input_batch.num_tokens_no_spec[req_index] = end_token_index
-                self.input_batch.num_tokens[req_index] = end_token_index
+                with record_function_or_nullcontext("update running/resumed requests:: update block_ids"):
+                    # Update the block IDs.
+                    if not resumed_from_preemption:
+                        if new_block_ids is not None:
+                            # Append the new blocks to the existing block IDs.
+                            for block_ids, new_ids in zip(req_state.block_ids, new_block_ids):
+                                block_ids.extend(new_ids)
+                    else:
+                        assert req_index is None
+                        assert new_block_ids is not None
+                        # The request is resumed from preemption.
+                        # Replace the existing block IDs with the new ones.
+                        req_state.block_ids = new_block_ids
 
-            # Add spec_token_ids to token_ids_cpu.
-            spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(
-                req_id, []
-            )
-            num_spec_tokens = len(spec_token_ids)
+                with record_function_or_nullcontext("update running/resumed requests:: get preempted request"):
+                    if req_index is None:
+                        # The request is not in the persistent batch.
+                        # The request was either preempted and resumed later, or was not
+                        # scheduled in the previous step and needs to be added again.
 
-            is_empty_draft_tokens = (
-                self._is_empty_draft_tokens is not None
-                and req_index is not None
-                and self._is_empty_draft_tokens[req_index].item()
-            )
+                        if self.use_async_scheduling and num_output_tokens > 0:
+                            # We must recover the output token ids for resumed requests in the
+                            # async scheduling case, so that correct input_ids are obtained.
+                            resumed_token_ids = req_data.all_token_ids[req_id]
+                            req_state.output_token_ids = resumed_token_ids[-num_output_tokens:]
 
-            # For async scheduling, token_ids_cpu assigned from
-            # spec_token_ids are placeholders and will be overwritten in
-            # _prepare_input_ids.
-            if num_spec_tokens and not is_empty_draft_tokens:
-                start_index = self.input_batch.num_tokens_no_spec[req_index]
-                end_token_index = start_index + num_spec_tokens
-                self.input_batch.token_ids_cpu[
-                    req_index, start_index:end_token_index
-                ] = spec_token_ids
-                # NOTE(woosuk): `num_tokens` here may include spec tokens.
-                self.input_batch.num_tokens[req_index] += num_spec_tokens
+                        reqs_to_add.append(req_state)
+                        # Track resumed requests for ngram_gpu full tensor copy
+                        if is_ngram_gpu:
+                            ngram_gpu_new_reqs.append(req_state)
+                        continue
 
-            # When speculative decoding is used with structured output,
-            # the scheduler can drop draft tokens that do not
-            # conform to the schema. This can result in
-            # scheduler_output.scheduled_spec_decode_tokens being empty,
-            # even when speculative decoding is enabled.
-            self.input_batch.spec_token_ids[req_index].clear()
-            self.input_batch.spec_token_ids[req_index].extend(spec_token_ids)
+                with record_function_or_nullcontext("update running/resumed requests:: update persistent batch"):
+                    # Update the persistent batch.
+                    self.input_batch.num_computed_tokens_cpu[req_index] = num_computed_tokens
+                    if new_block_ids is not None:
+                        self.input_batch.block_table.append_row(new_block_ids, req_index)
 
-            # For async scheduling with speculative decoding:
-            # When draft tokens are invalid (e.g., ngram proposer returns all
-            # zeros), we skip the forward computation for those tokens to save
-            # resources. However, we must keep scheduled_spec_decode_tokens so
-            # that the Scheduler can correctly adjust num_computed_tokens and
-            # num_output_placeholders in update_from_output().
-            if self.use_async_scheduling:
-                req_state.prev_num_draft_len = num_spec_tokens
-                if (
-                    num_spec_tokens
-                    and self._draft_token_ids is None
-                    or is_empty_draft_tokens
+                    # For the last rank, we don't need to update the token_ids_cpu
+                    # because the sampled tokens are already cached.
+                    if not is_last_rank:
+                        # Add new_token_ids to token_ids_cpu.
+                        start_token_index = num_computed_tokens
+                        end_token_index = num_computed_tokens + len(new_token_ids)
+                        self.input_batch.token_ids_cpu[
+                            req_index, start_token_index:end_token_index
+                        ] = new_token_ids
+                        self.input_batch.num_tokens_no_spec[req_index] = end_token_index
+                        self.input_batch.num_tokens[req_index] = end_token_index
+
+                with record_function_or_nullcontext("update running/resumed requests:: update spec token ids"):
+                    # Add spec_token_ids to token_ids_cpu.
+                    spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(
+                        req_id, []
+                    )
+                    num_spec_tokens = len(spec_token_ids)
+
+                    # Use pre-copied CPU tensor to avoid per-request DtoH sync
+                    is_empty_draft_tokens = (
+                        is_empty_draft_tokens_cpu is not None
+                        and req_index is not None
+                        and is_empty_draft_tokens_cpu[req_index].item()
+                    )
+
+                with record_function_or_nullcontext("update running/resumed requests:: update token ids cpu"):
+                    # For async scheduling, token_ids_cpu assigned from
+                    # spec_token_ids are placeholders and will be overwritten in
+                    # _prepare_input_ids.
+                    if num_spec_tokens and not is_empty_draft_tokens:
+                        start_index = self.input_batch.num_tokens_no_spec[req_index]
+                        end_token_index = start_index + num_spec_tokens
+                        self.input_batch.token_ids_cpu[
+                            req_index, start_index:end_token_index
+                        ] = spec_token_ids
+                        # NOTE(woosuk): `num_tokens` here may include spec tokens.
+                        self.input_batch.num_tokens[req_index] += num_spec_tokens
+
+                # When speculative decoding is used with structured output,
+                # the scheduler can drop draft tokens that do not
+                # conform to the schema. This can result in
+                # scheduler_output.scheduled_spec_decode_tokens being empty,
+                # even when speculative decoding is enabled.
+                with record_function_or_nullcontext("update running/resumed requests:: update input batch spec token ids"):
+                    self.input_batch.spec_token_ids[req_index].clear()
+                    self.input_batch.spec_token_ids[req_index].extend(spec_token_ids)
+
+                # For async scheduling with speculative decoding:
+                # When draft tokens are invalid (e.g., ngram proposer returns all
+                # zeros), we skip the forward computation for those tokens to save
+                # resources. However, we must keep scheduled_spec_decode_tokens so
+                # that the Scheduler can correctly adjust num_computed_tokens and
+                # num_output_placeholders in update_from_output().
+                if self.use_async_scheduling:
+                    with record_function_or_nullcontext("update running/resumed requests:: update prev_num_draft_len"):
+                        req_state.prev_num_draft_len = num_spec_tokens
+                    # Collect indices and values for batch GPU update
+                    # instead of per-request HtoD sync
+                    if self.use_gpu_input_correction and req_index is not None:
+                        with record_function_or_nullcontext("update running/resumed requests:: collect cached prev_num_draft_len"):
+                            self._update_draft_len_indices_cpu[draft_len_update_count] = req_index
+                            self._update_draft_len_values_cpu[draft_len_update_count] = num_spec_tokens
+                            draft_len_update_count += 1
+                    with record_function_or_nullcontext("update running/resumed requests:: update scheduled spec decode tokens"):
+                        if (
+                            num_spec_tokens
+                            and self._draft_token_ids is None
+                            or is_empty_draft_tokens
+                        ):
+                            scheduler_output.total_num_scheduled_tokens -= num_spec_tokens
+                            scheduler_output.num_scheduled_tokens[req_id] -= num_spec_tokens
+                            scheduler_output.scheduled_spec_decode_tokens.pop(req_id, None)
+
+            # Batch update cached_prev_num_draft_len_gpu after the loop
+            # to avoid per-request HtoD synchronization
+            if draft_len_update_count > 0:
+                with record_function_or_nullcontext("update running/resumed requests:: batch update cached_prev_num_draft_len_gpu"):
+                    indices_gpu = self._update_draft_len_indices_cpu[:draft_len_update_count].to(
+                        self.device, non_blocking=True
+                    )
+                    values_gpu = self._update_draft_len_values_cpu[:draft_len_update_count].to(
+                        self.device, non_blocking=True
+                    )
+                    self.cached_prev_num_draft_len_gpu.scatter_(0, indices_gpu, values_gpu)
+
+        with record_function_or_nullcontext("_update_states:: add new requests to persistent batch"):
+            # Add the new or resumed requests to the persistent batch.
+            # The smaller empty indices are filled first.
+            for request in reqs_to_add:
+                self.input_batch.add_request(request)
+
+        with record_function_or_nullcontext("_update_states:: condense batch"):
+            # Condense the batched states if there are gaps left by removed requests
+            self.input_batch.condense()
+            # Allow attention backend to reorder the batch, potentially
+            self._may_reorder_batch(scheduler_output)
+            # Refresh batch metadata with any pending updates.
+            self.input_batch.refresh_metadata()
+
+        with record_function_or_nullcontext("_update_states:: update ngram_gpu tensors"):
+            # Incrementally update ngram_gpu tensors after batch is stable
+            if is_ngram_gpu:
+                with record_function_or_nullcontext(
+                    "gpu_model_runner: update_ngram_gpu_tensors_incremental"
                 ):
-                    scheduler_output.total_num_scheduled_tokens -= num_spec_tokens
-                    scheduler_output.num_scheduled_tokens[req_id] -= num_spec_tokens
-                    scheduler_output.scheduled_spec_decode_tokens.pop(req_id, None)
-        # Add the new or resumed requests to the persistent batch.
-        # The smaller empty indices are filled first.
-        for request in reqs_to_add:
-            self.input_batch.add_request(request)
-
-        # Condense the batched states if there are gaps left by removed requests
-        self.input_batch.condense()
-        # Allow attention backend to reorder the batch, potentially
-        self._may_reorder_batch(scheduler_output)
-        # Refresh batch metadata with any pending updates.
-        self.input_batch.refresh_metadata()
-
-        # Incrementally update ngram_gpu tensors after batch is stable
-        if is_ngram_gpu:
-            with record_function_or_nullcontext(
-                "gpu_model_runner: update_ngram_gpu_tensors_incremental"
-            ):
-                self._update_ngram_gpu_tensors_incremental(ngram_gpu_new_reqs)
+                    self._update_ngram_gpu_tensors_incremental(ngram_gpu_new_reqs)
 
         # Build curr_to_prev_idx mapping for GPU input correction
         # This must be done after condense/reorder but before we lose
         # prev_req_id_to_index information
         if use_gpu_correction:
-            self._build_curr_to_prev_idx_mapping(self.input_batch.num_reqs)
+            with record_function_or_nullcontext("_update_states:: build curr_to_prev_idx_mapping"):
+                self._build_curr_to_prev_idx_mapping(self.input_batch.num_reqs)
 
     def _update_ngram_gpu_tensors_incremental(
         self,
@@ -3057,24 +3158,29 @@ class GPUModelRunner(
         # scheduler_output in engine core process.
         # TODO(Ronald1995): deepcopy is expensive when there is a large
         # number of requests, optimize it later.
-        if (
-            self.use_async_scheduling
-            and self.num_spec_tokens
-            and self._draft_token_ids is None
-            or (
-                self.speculative_config is not None
-                and self.speculative_config.method == "ngram_gpu"
-                and self._is_empty_draft_tokens is not None
-                and self._is_empty_draft_tokens.any()
-            )
-        ):
-            scheduler_output = deepcopy(scheduler_output)
+        # TODO(patchy): COST TOO MUCH TIME!!!
+        with record_function_or_nullcontext("gpu_model_runner: deepcopy scheduler_output"):
+            if (
+                self.use_async_scheduling
+                and self.num_spec_tokens
+                and self._draft_token_ids is None
+                or (
+                    self.speculative_config is not None
+                    and self.speculative_config.method == "ngram_gpu"
+                    and self._is_empty_draft_tokens is not None
+                    and self._is_empty_draft_tokens.any()
+                )
+            ):
+                scheduler_output = deepcopy(scheduler_output)
+        
+        with record_function_or_nullcontext("gpu_model_runner: get num scheduled tokens"):
+            num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 
-        num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         with record_function_or_nullcontext("gpu_model_runner: preprocess"):
             with self.synchronize_input_prep():
                 # Update persistent batch states.
-                self._update_states(scheduler_output)
+                with record_function_or_nullcontext("gpu_model_runner: _update_states"):
+                    self._update_states(scheduler_output)
 
                 if has_ec_transfer() and get_ec_transfer().is_producer:
                     with self.maybe_get_ec_connector_output(
@@ -3117,13 +3223,15 @@ class GPUModelRunner(
                 max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
                 num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
 
-                (
-                    logits_indices,
-                    spec_decode_metadata,
-                ) = self._prepare_inputs(
-                    scheduler_output,
-                    num_scheduled_tokens_np,
-                )
+
+                with record_function_or_nullcontext("gpu_model_runner: _prepare_inputs"):
+                    (
+                        logits_indices,
+                        spec_decode_metadata,
+                    ) = self._prepare_inputs(
+                        scheduler_output,
+                        num_scheduled_tokens_np,
+                    )
 
                 cascade_attn_prefix_lens = None
                 # Disable cascade attention when using microbatching (DBO)
@@ -3135,19 +3243,20 @@ class GPUModelRunner(
                         scheduler_output.num_common_prefix_blocks,
                     )
 
-                (
-                    cudagraph_mode,
-                    batch_desc,
-                    ubatch_slices,
-                    num_tokens_across_dp,
-                    cudagraph_stats,
-                ) = self._determine_batch_execution_and_padding(
-                    num_tokens=num_tokens_unpadded,
-                    num_reqs=num_reqs,
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    max_num_scheduled_tokens=max_num_scheduled_tokens,
-                    use_cascade_attn=cascade_attn_prefix_lens is not None,
-                )
+                with record_function_or_nullcontext("gpu_model_runner: _determine_batch_execution_and_padding"):
+                    (
+                        cudagraph_mode,
+                        batch_desc,
+                        ubatch_slices,
+                        num_tokens_across_dp,
+                        cudagraph_stats,
+                    ) = self._determine_batch_execution_and_padding(
+                        num_tokens=num_tokens_unpadded,
+                        num_reqs=num_reqs,
+                        num_scheduled_tokens_np=num_scheduled_tokens_np,
+                        max_num_scheduled_tokens=max_num_scheduled_tokens,
+                        use_cascade_attn=cascade_attn_prefix_lens is not None,
+                    )
 
                 logger.debug(
                     "Running batch with cudagraph_mode: %s, batch_descriptor: %s, "
@@ -3166,49 +3275,51 @@ class GPUModelRunner(
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
-                (attn_metadata, spec_decode_common_attn_metadata) = (
-                    self._build_attention_metadata(
-                        num_tokens=num_tokens_unpadded,
-                        num_tokens_padded=num_tokens_padded if pad_attn else None,
-                        num_reqs=num_reqs,
-                        num_reqs_padded=num_reqs_padded if pad_attn else None,
-                        max_query_len=max_num_scheduled_tokens,
-                        ubatch_slices=ubatch_slices,
-                        logits_indices=logits_indices,
-                        use_spec_decode=use_spec_decode,
-                        num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-                        cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                with record_function_or_nullcontext("gpu_model_runner: _build_attention_metadata"):
+                    (attn_metadata, spec_decode_common_attn_metadata) = (
+                        self._build_attention_metadata(
+                            num_tokens=num_tokens_unpadded,
+                            num_tokens_padded=num_tokens_padded if pad_attn else None,
+                            num_reqs=num_reqs,
+                            num_reqs_padded=num_reqs_padded if pad_attn else None,
+                            max_query_len=max_num_scheduled_tokens,
+                            ubatch_slices=ubatch_slices,
+                            logits_indices=logits_indices,
+                            use_spec_decode=use_spec_decode,
+                            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+                        )
                     )
+
+            with record_function_or_nullcontext("gpu_model_runner: _preprocess"):
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    ec_connector_output,
+                ) = self._preprocess(
+                    scheduler_output, num_tokens_padded, intermediate_tensors
                 )
 
-            (
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
-                ec_connector_output,
-            ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
-            )
-
-            print("In execute_model::preprocess before modify gpu input parameters:")
-            print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
-            print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
-            print(f"\t\tinput_ids: {input_ids}")
-            print(f"\t\tpositions: {positions}")
-            print(f"\t\tself.positions.gpu: {self.positions.gpu}")
-            print(f"\t\tseq_lens: {self.seq_lens.gpu}")
-            print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
-            print(f"\t\tnum_reqs: {num_reqs}")
-            for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
-                blk_table = self.input_batch.block_table[kv_cache_gid]
-                blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-                slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
-                print(
-                    f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}"
-                )
-                print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
+            # print("In execute_model::preprocess before modify gpu input parameters:")
+            # print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
+            # print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
+            # print(f"\t\tinput_ids: {input_ids}")
+            # print(f"\t\tpositions: {positions}")
+            # print(f"\t\tself.positions.gpu: {self.positions.gpu}")
+            # print(f"\t\tseq_lens: {self.seq_lens.gpu}")
+            # print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
+            # print(f"\t\tnum_reqs: {num_reqs}")
+            # for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
+            #     blk_table = self.input_batch.block_table[kv_cache_gid]
+            #     blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+            #     slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
+            #     print(
+            #         f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}"
+            #     )
+            #     print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
 
             # Apply GPU-side correction for positions, seq_lens, and slot_mapping
             # when using async scheduling with speculative decoding.
@@ -3220,23 +3331,24 @@ class GPUModelRunner(
             # and _draft_token_ids, which don't depend on num_computed_tokens.
             # Only positions, seq_lens, and slot_mapping need GPU correction.
             if self.use_gpu_input_correction:
-                # Get the block table for the first KV cache group (main attention)
-                # For models with multiple KV cache groups, we correct all of them
-                for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
-                    blk_table = self.input_batch.block_table[kv_cache_gid]
-                    blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-                    slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
+                with record_function_or_nullcontext("gpu_model_runner: correct_inputs_on_gpu"):
+                    # Get the block table for the first KV cache group (main attention)
+                    # For models with multiple KV cache groups, we correct all of them
+                    for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
+                        blk_table = self.input_batch.block_table[kv_cache_gid]
+                        blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+                        slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
 
-                    self._correct_inputs_on_gpu(
-                        positions=positions
-                        if not self.uses_mrope and self.uses_xdrope_dim <= 0
-                        else self.positions.gpu,
-                        seq_lens=self.seq_lens.gpu,
-                        slot_mapping=slot_mapping,
-                        query_start_loc=self.query_start_loc.gpu,
-                        block_table=blk_table_tensor,
-                        num_reqs=num_reqs,
-                    )
+                        self._correct_inputs_on_gpu(
+                            positions=positions
+                            if not self.uses_mrope and self.uses_xdrope_dim <= 0
+                            else self.positions.gpu,
+                            seq_lens=self.seq_lens.gpu,
+                            slot_mapping=slot_mapping,
+                            query_start_loc=self.query_start_loc.gpu,
+                            block_table=blk_table_tensor,
+                            num_reqs=num_reqs,
+                        )
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -3246,22 +3358,22 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
-        print("In execute_model::model_forward input parameters:")
-        print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
-        print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
-        print(f"\t\tinput_ids: {input_ids}")
-        print(f"\t\tpositions: {positions}")
-        print(f"\t\tself.positions.gpu: {self.positions.gpu}")
-        print(f"\t\tseq_lens: {self.seq_lens.gpu}")
-        print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
-        print(f"\t\tnum_reqs: {num_reqs}")
-        for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
-            blk_table = self.input_batch.block_table[kv_cache_gid]
-            blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-            slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
-            print(f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}")
-            print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
-        print("----------------------------------------------------------")
+        # print("In execute_model::model_forward input parameters:")
+        # print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
+        # print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
+        # print(f"\t\tinput_ids: {input_ids}")
+        # print(f"\t\tpositions: {positions}")
+        # print(f"\t\tself.positions.gpu: {self.positions.gpu}")
+        # print(f"\t\tseq_lens: {self.seq_lens.gpu}")
+        # print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
+        # print(f"\t\tnum_reqs: {num_reqs}")
+        # for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
+        #     blk_table = self.input_batch.block_table[kv_cache_gid]
+        #     blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+        #     slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
+        #     print(f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}")
+        #     print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
+        # print("----------------------------------------------------------")
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -3471,9 +3583,11 @@ class GPUModelRunner(
                         next_token_ids,
                         next_token_ids.shape[0],
                     )
-                    # When input_fits_in_drafter=False, no draft tokens are generated
-                    # so we cache None (which results in draft_len=0)
-                    self._cache_prev_num_draft_len_gpu(None, next_token_ids.shape[0])
+                    # Cache scheduler's spec_decode_tokens count
+                    # (even when input_fits_in_drafter=False)
+                    self._cache_prev_num_draft_len_gpu(
+                        scheduler_output, next_token_ids.shape[0]
+                    )
                 else:
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
@@ -3503,9 +3617,11 @@ class GPUModelRunner(
                         next_token_ids,
                         next_token_ids.shape[0],
                     )
-                    # When input_fits_in_drafter=False, no draft tokens are generated
-                    # so we cache None (which results in draft_len=0)
-                    self._cache_prev_num_draft_len_gpu(None, next_token_ids.shape[0])
+                    # Cache scheduler's spec_decode_tokens count
+                    # (even when input_fits_in_drafter=False)
+                    self._cache_prev_num_draft_len_gpu(
+                        scheduler_output, next_token_ids.shape[0]
+                    )
                 else:
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
@@ -3664,35 +3780,39 @@ class GPUModelRunner(
             block_table: [num_reqs, max_num_blocks_per_req] block table
             num_reqs: number of requests in current batch
         """
-        print(
-            f"[_correct_inputs_on_gpu] num_reqs={num_reqs}, prev_num_reqs={self.prev_num_reqs}"
-        )
+        # print(
+        #     f"[_correct_inputs_on_gpu] num_reqs={num_reqs}, prev_num_reqs={self.prev_num_reqs}"
+        # )
         if num_reqs == 0 or self.prev_num_reqs == 0:
-            print(
-                f"[_correct_inputs_on_gpu] Early return: num_reqs={num_reqs}, prev_num_reqs={self.prev_num_reqs}"
-            )
+            # print(
+            #     f"[_correct_inputs_on_gpu] Early return: num_reqs={num_reqs}, prev_num_reqs={self.prev_num_reqs}"
+            # )
             return
 
-        # Get the mapping and cached values
+        # Get the mapping and cached values.
+        # NOTE: We use prev_prev_num_draft_len_gpu (not cached_prev_num_draft_len_gpu)
+        # because _correct_inputs_on_gpu runs AFTER _update_states which swaps the
+        # double buffers. So prev_prev_num_draft_len_gpu now contains the values
+        # from the PREVIOUS step, which is what we need for correction.
         curr_to_prev = self.curr_to_prev_idx_gpu[:num_reqs]
         valid_counts = self.cached_valid_sampled_token_count_gpu
-        prev_draft_lens = self.cached_prev_num_draft_len_gpu
+        prev_draft_lens = self.prev_prev_num_draft_len_gpu
 
-        print(f"[_correct_inputs_on_gpu] curr_to_prev={curr_to_prev}")
-        print(
-            f"[_correct_inputs_on_gpu] valid_counts[:num_reqs]={valid_counts[:num_reqs]}"
-        )
-        print(
-            f"[_correct_inputs_on_gpu] prev_draft_lens[:num_reqs]={prev_draft_lens[:num_reqs]}"
-        )
+        # print(f"[_correct_inputs_on_gpu] curr_to_prev={curr_to_prev}")
+        # print(
+        #     f"[_correct_inputs_on_gpu] valid_counts[:num_reqs]={valid_counts[:num_reqs]}"
+        # )
+        # print(
+        #     f"[_correct_inputs_on_gpu] prev_draft_lens[:num_reqs]={prev_draft_lens[:num_reqs]}"
+        # )
 
         # Find requests that need correction (have valid previous index)
         has_prev = curr_to_prev >= 0  # [num_reqs]
 
         if not has_prev.any():
-            print(
-                "[_correct_inputs_on_gpu] Early return: no requests have previous index"
-            )
+            # print(
+            #     "[_correct_inputs_on_gpu] Early return: no requests have previous index"
+            # )
             return
 
         # Gather previous draft lengths and valid counts for current requests
@@ -3707,30 +3827,30 @@ class GPUModelRunner(
         #              = prev_draft_len - valid_count + 1
         num_rejected = (prev_draft_len - valid_count + 1).clamp(min=0)
 
-        print(f"[_correct_inputs_on_gpu] prev_draft_len={prev_draft_len}")
-        print(f"[_correct_inputs_on_gpu] valid_count={valid_count}")
-        print(f"[_correct_inputs_on_gpu] num_rejected={num_rejected}")
+        # print(f"[_correct_inputs_on_gpu] prev_draft_len={prev_draft_len}")
+        # print(f"[_correct_inputs_on_gpu] valid_count={valid_count}")
+        # print(f"[_correct_inputs_on_gpu] num_rejected={num_rejected}")
 
         # Only correct requests with prev_draft_len > 0 and valid previous index
         needs_correction = has_prev & (prev_draft_len > 0) & (num_rejected > 0)
 
-        print(f"[_correct_inputs_on_gpu] needs_correction={needs_correction}")
+        # print(f"[_correct_inputs_on_gpu] needs_correction={needs_correction}")
 
         if not needs_correction.any():
-            print("[_correct_inputs_on_gpu] Early return: no requests need correction")
+            # print("[_correct_inputs_on_gpu] Early return: no requests need correction")
             return
 
         # Correct seq_lens: seq_lens[i] -= num_rejected[i]
         # Only modify the first num_reqs elements
         correction = num_rejected * needs_correction.int()
-        print(f"[_correct_inputs_on_gpu] correction={correction}")
-        print(
-            f"[_correct_inputs_on_gpu] BEFORE seq_lens[:num_reqs]={seq_lens[:num_reqs]}"
-        )
+        # print(f"[_correct_inputs_on_gpu] correction={correction}")
+        # print(
+        #     f"[_correct_inputs_on_gpu] BEFORE seq_lens[:num_reqs]={seq_lens[:num_reqs]}"
+        # )
         seq_lens[:num_reqs].sub_(correction)
-        print(
-            f"[_correct_inputs_on_gpu] AFTER seq_lens[:num_reqs]={seq_lens[:num_reqs]}"
-        )
+        # print(
+        #     f"[_correct_inputs_on_gpu] AFTER seq_lens[:num_reqs]={seq_lens[:num_reqs]}"
+        # )
 
         # For positions and slot_mapping, we need to iterate per request
         # because each request has different token ranges
@@ -3759,14 +3879,14 @@ class GPUModelRunner(
         correction_per_token = correction[token_to_req]  # [total_tokens]
 
         # Correct positions: positions[t] -= num_rejected for that token's request
-        print(
-            f"[_correct_inputs_on_gpu] BEFORE positions[:total_tokens]={positions[:total_tokens]}"
-        )
-        print(f"[_correct_inputs_on_gpu] correction_per_token={correction_per_token}")
+        # print(
+        #     f"[_correct_inputs_on_gpu] BEFORE positions[:total_tokens]={positions[:total_tokens]}"
+        # )
+        # print(f"[_correct_inputs_on_gpu] correction_per_token={correction_per_token}")
         positions[:total_tokens].sub_(correction_per_token)
-        print(
-            f"[_correct_inputs_on_gpu] AFTER positions[:total_tokens]={positions[:total_tokens]}"
-        )
+        # print(
+        #     f"[_correct_inputs_on_gpu] AFTER positions[:total_tokens]={positions[:total_tokens]}"
+        # )
 
         # Recalculate slot_mapping based on corrected positions
         # slot_mapping = block_table[req, pos // block_size] * block_size + pos % block_size
@@ -3798,14 +3918,14 @@ class GPUModelRunner(
         if not self.use_gpu_input_correction:
             return
 
-        print(f"[_cache_valid_sampled_token_count_gpu] num_reqs={num_reqs}")
-        print(
-            f"[_cache_valid_sampled_token_count_gpu] valid_sampled_tokens_count[:num_reqs]={valid_sampled_tokens_count[:num_reqs]}"
-        )
+        # print(f"[_cache_valid_sampled_token_count_gpu] num_reqs={num_reqs}")
+        # print(
+        #     f"[_cache_valid_sampled_token_count_gpu] valid_sampled_tokens_count[:num_reqs]={valid_sampled_tokens_count[:num_reqs]}"
+        # )
 
         # Cache the valid counts on GPU
         self.cached_valid_sampled_token_count_gpu[:num_reqs].copy_(
-            valid_sampled_tokens_count[:num_reqs]
+            valid_sampled_tokens_count[:num_reqs], non_blocking=True
         )
 
         # Also update prev_sampled_token_ids for async scheduling
@@ -3826,18 +3946,18 @@ class GPUModelRunner(
         if prev_req_id_to_index is None:
             # First iteration, no previous batch
             self.curr_to_prev_idx_cpu[:num_reqs].fill_(-1)
-            print(
-                "[_build_curr_to_prev_idx_mapping] First iteration, no previous batch"
-            )
+            # print(
+            #     "[_build_curr_to_prev_idx_mapping] First iteration, no previous batch"
+            # )
         else:
             for curr_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
                 prev_idx = prev_req_id_to_index.get(req_id, -1)
                 self.curr_to_prev_idx_cpu[curr_idx] = prev_idx
 
-        print(f"[_build_curr_to_prev_idx_mapping] num_reqs={num_reqs}")
-        print(
-            f"[_build_curr_to_prev_idx_mapping] curr_to_prev_idx_cpu[:num_reqs]={self.curr_to_prev_idx_cpu[:num_reqs]}"
-        )
+        # print(f"[_build_curr_to_prev_idx_mapping] num_reqs={num_reqs}")
+        # print(
+        #     f"[_build_curr_to_prev_idx_mapping] curr_to_prev_idx_cpu[:num_reqs]={self.curr_to_prev_idx_cpu[:num_reqs]}"
+        # )
 
         # Copy to GPU (non-blocking, will be synchronized before use)
         self.curr_to_prev_idx_gpu[:num_reqs].copy_(
@@ -3846,54 +3966,37 @@ class GPUModelRunner(
 
     def _cache_prev_num_draft_len_gpu(
         self,
-        draft_token_ids: torch.Tensor | list[list[int]] | None,
+        scheduler_output: "SchedulerOutput",
         num_reqs: int,
     ) -> None:
         """
-        Cache the number of draft tokens for each request in the current step.
-        This will be used in the next step to calculate num_rejected.
+        Save prev_num_reqs for the next step's GPU correction.
+
+        NOTE: The actual caching of prev_num_draft_len for each request is now
+        done in _update_states (around line 1090), where we set:
+            cached_prev_num_draft_len_gpu[req_index] = num_spec_tokens
+        This matches the semantics of req_state.prev_num_draft_len which is
+        also set in _update_states.
+
+        This function is kept to:
+        1. Save prev_num_reqs for the next iteration
+        2. Provide debug logging
 
         Args:
-            draft_token_ids: The draft tokens produced in the current step.
-                Can be a tensor of shape [num_reqs, num_spec_tokens] or list of lists.
-                If None, draft_len is 0 for all requests.
+            scheduler_output: The scheduler output (used for debug logging)
             num_reqs: Number of requests in current batch.
         """
         if not self.use_gpu_input_correction:
             return
 
-        # Reset to zero
-        self.cached_prev_num_draft_len_gpu[:num_reqs].zero_()
-
-        if draft_token_ids is not None:
-            if isinstance(draft_token_ids, torch.Tensor):
-                # For tensor format: count non-padding tokens per row
-                # Assuming -1 or similar padding value for invalid tokens
-                # The tensor shape is [num_reqs, num_spec_tokens]
-                # Count valid (non-negative) tokens per request
-                valid_mask = draft_token_ids >= 0
-                draft_lens = valid_mask.sum(dim=1).to(torch.int32)
-                self.cached_prev_num_draft_len_gpu[:num_reqs].copy_(
-                    draft_lens[:num_reqs]
-                )
-            else:
-                # For list format
-                for req_idx, tokens in enumerate(draft_token_ids):
-                    if req_idx < num_reqs:
-                        self.cached_prev_num_draft_len_gpu[req_idx] = len(tokens)
-
-        print(f"[_cache_prev_num_draft_len_gpu] num_reqs={num_reqs}")
-        print(
-            f"[_cache_prev_num_draft_len_gpu] draft_token_ids type={type(draft_token_ids)}"
-        )
-        if isinstance(draft_token_ids, torch.Tensor):
-            print(
-                f"[_cache_prev_num_draft_len_gpu] draft_token_ids shape={draft_token_ids.shape}"
-            )
-            print(f"[_cache_prev_num_draft_len_gpu] draft_token_ids={draft_token_ids}")
-        print(
-            f"[_cache_prev_num_draft_len_gpu] cached_prev_num_draft_len_gpu[:num_reqs]={self.cached_prev_num_draft_len_gpu[:num_reqs]}"
-        )
+        # scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
+        # print(f"[_cache_prev_num_draft_len_gpu] num_reqs={num_reqs}")
+        # print(
+        #     f"[_cache_prev_num_draft_len_gpu] scheduled_spec_tokens keys={list(scheduled_spec_tokens.keys())}"
+        # )
+        # print(
+        #     f"[_cache_prev_num_draft_len_gpu] cached_prev_num_draft_len_gpu[:num_reqs]={self.cached_prev_num_draft_len_gpu[:num_reqs]}"
+        # )
 
         # Save current num_reqs for next iteration
         self.prev_num_reqs = num_reqs
@@ -3931,83 +4034,90 @@ class GPUModelRunner(
             assert isinstance(sampled_token_ids, torch.Tensor), (
                 "sampled_token_ids should be a torch.Tensor for ngram_gpu"
             )
-            (
-                next_token_ids,
-                valid_sampled_tokens_count,
-                valid_sampled_token_ids_gpu,
-            ) = self.drafter.update_token_ids_ngram(
-                sampled_token_ids,
-                self.input_batch,
-                self.token_ids_gpu_tensor,
-                self.num_tokens_no_spec_gpu,
-                self.discard_request_mask.gpu,
-            )
+            with record_function_or_nullcontext("Drafter: update_token_ids_ngram"):
+                (
+                    next_token_ids,
+                    valid_sampled_tokens_count,
+                    valid_sampled_token_ids_gpu,
+                ) = self.drafter.update_token_ids_ngram(
+                    sampled_token_ids,
+                    self.input_batch,
+                    self.token_ids_gpu_tensor,
+                    self.num_tokens_no_spec_gpu,
+                    self.discard_request_mask.gpu,
+                )
             if self.use_gpu_input_correction:
                 # Cache on GPU for next step's correction
-                self._cache_valid_sampled_token_count_gpu(
-                    valid_sampled_tokens_count,
-                    next_token_ids,
-                    next_token_ids.shape[0],
-                )
+                with record_function_or_nullcontext("Drafter: _cache_valid_sampled_token_count_gpu"):
+                    self._cache_valid_sampled_token_count_gpu(
+                        valid_sampled_tokens_count,
+                        next_token_ids,
+                        next_token_ids.shape[0],
+                    )
                 # NOTE: _cache_prev_num_draft_len_gpu is called AFTER propose()
-                # because we need the actual draft_token_ids produced by the drafter
+                # to cache scheduler's spec_decode_tokens count for next step
             else:
-                self._copy_valid_sampled_token_count(
-                    next_token_ids, valid_sampled_tokens_count
+                with record_function_or_nullcontext("Drafter: _copy_valid_sampled_token_count"):
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
+
+
+            with record_function_or_nullcontext("Drafter: update input token tensor"):
+                batch_size = next_token_ids.shape[0]
+                max_new_tokens = valid_sampled_token_ids_gpu.shape[1]  # num_spec_tokens + 1
+
+                current_lens = self.num_tokens_no_spec_gpu[:batch_size]
+                offsets = torch.arange(max_new_tokens, device=self.device)
+
+                write_positions = current_lens.unsqueeze(1) + offsets.unsqueeze(0)
+                valid_write_mask = offsets.unsqueeze(
+                    0
+                ) < valid_sampled_tokens_count.unsqueeze(1)
+                combined_mask = valid_write_mask & (valid_sampled_token_ids_gpu != -1)
+
+                token_ids_slice = self.token_ids_gpu_tensor[:batch_size]
+                write_positions_long = write_positions.long()
+                existing_values = token_ids_slice.gather(1, write_positions_long)
+
+                tokens_cast = valid_sampled_token_ids_gpu.to(token_ids_slice.dtype)
+                tokens_to_scatter = torch.where(
+                    combined_mask,
+                    tokens_cast,
+                    existing_values,
                 )
+                token_ids_slice.scatter_(1, write_positions_long, tokens_to_scatter)
 
-            batch_size = next_token_ids.shape[0]
-            max_new_tokens = valid_sampled_token_ids_gpu.shape[1]  # num_spec_tokens + 1
+                self.num_tokens_no_spec_gpu[:batch_size] += valid_sampled_tokens_count
 
-            current_lens = self.num_tokens_no_spec_gpu[:batch_size]
-            offsets = torch.arange(max_new_tokens, device=self.device)
+                sampled_flags = valid_sampled_tokens_count > 0
+                valid_mask = torch.ones(batch_size, dtype=torch.bool, device=self.device)
 
-            write_positions = current_lens.unsqueeze(1) + offsets.unsqueeze(0)
-            valid_write_mask = offsets.unsqueeze(
-                0
-            ) < valid_sampled_tokens_count.unsqueeze(1)
-            combined_mask = valid_write_mask & (valid_sampled_token_ids_gpu != -1)
+                if self.input_batch.spec_decode_unsupported_reqs:
+                    # Get indices of unsupported requests that are in current batch
+                    unsupported_indices = [
+                        self.input_batch.req_id_to_index[req_id]
+                        for req_id in self.input_batch.spec_decode_unsupported_reqs
+                        if req_id in self.input_batch.req_id_to_index
+                        and self.input_batch.req_id_to_index[req_id] < batch_size
+                    ]
+                    if unsupported_indices:
+                        valid_mask[unsupported_indices] = False
 
-            token_ids_slice = self.token_ids_gpu_tensor[:batch_size]
-            write_positions_long = write_positions.long()
-            existing_values = token_ids_slice.gather(1, write_positions_long)
+            with record_function_or_nullcontext("Drafter: propose"):
+                draft_token_ids, is_empty_draft_tokens = self.drafter.propose(
+                    self.num_tokens_no_spec_gpu[:batch_size],
+                    self.token_ids_gpu_tensor[:batch_size],
+                    sampled_flags,
+                    valid_mask,
+                )
+                # Cache is_empty_draft_tokens for filtering in _update_states
+                self._is_empty_draft_tokens = is_empty_draft_tokens
 
-            tokens_cast = valid_sampled_token_ids_gpu.to(token_ids_slice.dtype)
-            tokens_to_scatter = torch.where(
-                combined_mask,
-                tokens_cast,
-                existing_values,
-            )
-            token_ids_slice.scatter_(1, write_positions_long, tokens_to_scatter)
-
-            self.num_tokens_no_spec_gpu[:batch_size] += valid_sampled_tokens_count
-
-            sampled_flags = valid_sampled_tokens_count > 0
-            valid_mask = torch.ones(batch_size, dtype=torch.bool, device=self.device)
-
-            if self.input_batch.spec_decode_unsupported_reqs:
-                # Get indices of unsupported requests that are in current batch
-                unsupported_indices = [
-                    self.input_batch.req_id_to_index[req_id]
-                    for req_id in self.input_batch.spec_decode_unsupported_reqs
-                    if req_id in self.input_batch.req_id_to_index
-                    and self.input_batch.req_id_to_index[req_id] < batch_size
-                ]
-                if unsupported_indices:
-                    valid_mask[unsupported_indices] = False
-
-            draft_token_ids, is_empty_draft_tokens = self.drafter.propose(
-                self.num_tokens_no_spec_gpu[:batch_size],
-                self.token_ids_gpu_tensor[:batch_size],
-                sampled_flags,
-                valid_mask,
-            )
-            # Cache is_empty_draft_tokens for filtering in _update_states
-            self._is_empty_draft_tokens = is_empty_draft_tokens
-
-            # Now cache prev_num_draft_len using the actual draft_token_ids
+            # Cache scheduler's spec_decode_tokens count for next step's correction
             if self.use_gpu_input_correction:
-                self._cache_prev_num_draft_len_gpu(draft_token_ids, batch_size)
+                with record_function_or_nullcontext("Drafter: _cache_prev_num_draft_len_gpu"):
+                    self._cache_prev_num_draft_len_gpu(scheduler_output, batch_size)
         elif spec_config.method == "suffix":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, SuffixDecodingProposer)
@@ -4080,7 +4190,7 @@ class GPUModelRunner(
                         next_token_ids.shape[0],
                     )
                     # NOTE: _cache_prev_num_draft_len_gpu is called at the end
-                    # of this function after propose() produces draft_token_ids
+                    # to cache scheduler's spec_decode_tokens count for next step
                 else:
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
@@ -4154,11 +4264,12 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
             )
 
-            # Cache prev_num_draft_len using the actual draft_token_ids
+            # Cache scheduler's spec_decode_tokens count for next step's correction
             if self.use_gpu_input_correction:
-                self._cache_prev_num_draft_len_gpu(
-                    draft_token_ids, next_token_ids.shape[0]
-                )
+                with record_function_or_nullcontext("gpu_model_runner: cache_prev_num_draft_len_gpu"):
+                    self._cache_prev_num_draft_len_gpu(
+                        scheduler_output, next_token_ids.shape[0]
+                    )
 
         return draft_token_ids
 
