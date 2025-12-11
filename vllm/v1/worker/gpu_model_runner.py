@@ -8,10 +8,10 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
+from dataclasses import replace
 from functools import reduce
 from itertools import product
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
-from dataclasses import replace
 
 import numpy as np
 import torch
@@ -602,9 +602,7 @@ class GPUModelRunner(
         # CUDA event for synchronizing _is_empty_draft_tokens async copy
         self._is_empty_draft_tokens_event: torch.cuda.Event = torch.cuda.Event()
         # Dedicated stream for _is_empty_draft_tokens copy to overlap with GPU kernels
-        self._is_empty_draft_tokens_copy_stream: torch.cuda.Stream = (
-            torch.cuda.Stream()
-        )
+        self._is_empty_draft_tokens_copy_stream: torch.cuda.Stream = torch.cuda.Stream()
         # Number of requests copied in the async transfer
         self._is_empty_draft_tokens_copy_size: int = 0
         self.transfer_event = torch.Event()
@@ -664,8 +662,9 @@ class GPUModelRunner(
             )
             # Number of requests in the previous batch (for bounds checking)
             self.prev_num_reqs: int = 0
-            # Pre-allocated pinned memory for batch updating cached_prev_num_draft_len_gpu
-            # to avoid per-request HtoD synchronization in _update_states
+            # Pre-allocated pinned memory for batch updating
+            # cached_prev_num_draft_len_gpu to avoid per-request
+            # HtoD synchronization in _update_states
             self._update_draft_len_indices_cpu = torch.empty(
                 self.max_num_reqs, dtype=torch.int64, pin_memory=self.pin_memory
             )
@@ -881,7 +880,6 @@ class GPUModelRunner(
         for req_id in unscheduled_req_ids:
             self.input_batch.remove_request(req_id)
 
-
         # Check if ngram_gpu mode is enabled for incremental GPU tensor updates
         is_ngram_gpu = (
             self.speculative_config is not None
@@ -973,14 +971,6 @@ class GPUModelRunner(
             # GPU correction path: skip CPU sync, use empty list
             valid_sampled_token_count = []
 
-        # Sync the async copy of _is_empty_draft_tokens initiated in
-        # propose_draft_token_ids using CUDA event
-        # is_empty_draft_tokens_cpu: torch.Tensor | None = None
-        # if (self._is_empty_draft_tokens is not None
-        #         and self._is_empty_draft_tokens_copy_size > 0):
-        #     # Wait only for the copy operation to complete
-        #     self._is_empty_draft_tokens_event.synchronize()
-        #     is_empty_draft_tokens_cpu = self._is_empty_draft_tokens_cpu
         is_empty_draft_tokens_cpu = self._is_empty_draft_tokens_cpu
 
         # Collect indices and values for batch updating cached_prev_num_draft_len_gpu
@@ -1147,8 +1137,12 @@ class GPUModelRunner(
                 # Collect indices and values for batch GPU update
                 # instead of per-request HtoD sync
                 if self.use_gpu_input_correction and req_index is not None:
-                    self._update_draft_len_indices_cpu[draft_len_update_count] = req_index
-                    self._update_draft_len_values_cpu[draft_len_update_count] = num_spec_tokens
+                    self._update_draft_len_indices_cpu[draft_len_update_count] = (
+                        req_index
+                    )
+                    self._update_draft_len_values_cpu[draft_len_update_count] = (
+                        num_spec_tokens
+                    )
                     draft_len_update_count += 1
                 if (
                     num_spec_tokens
@@ -1162,9 +1156,9 @@ class GPUModelRunner(
         # Batch update cached_prev_num_draft_len_gpu after the loop
         # to avoid per-request HtoD synchronization
         if draft_len_update_count > 0:
-            indices_gpu = self._update_draft_len_indices_cpu[:draft_len_update_count].to(
-                self.device, non_blocking=True
-            )
+            indices_gpu = self._update_draft_len_indices_cpu[
+                :draft_len_update_count
+            ].to(self.device, non_blocking=True)
             values_gpu = self._update_draft_len_values_cpu[:draft_len_update_count].to(
                 self.device, non_blocking=True
             )
@@ -2857,7 +2851,9 @@ class GPUModelRunner(
         list[int],
     ]:
         # Async copy is_empty_draft_tokens to CPU using dedicated stream
-        self._copy_is_empty_draft_tokens(self._is_empty_draft_tokens, self.input_batch.num_reqs)
+        self._copy_is_empty_draft_tokens(
+            self._is_empty_draft_tokens, self.input_batch.num_reqs
+        )
 
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -3140,23 +3136,25 @@ class GPUModelRunner(
         # TODO(Ronald1995): deepcopy is expensive when there is a large
         # number of requests, optimize it later.
         # TODO(patchy): COST TOO MUCH TIME!!!
-        # if (
-        #     self.use_async_scheduling
-        #     and self.num_spec_tokens
-        #     and self._draft_token_ids is None
-        # ):
-        #     with record_function_or_nullcontext("gpu_model_runner: deepcopy scheduler_output"):
-        #         scheduler_output = deepcopy(scheduler_output)
         if (
-            self.speculative_config is not None
-            and self.speculative_config.method == "ngram_gpu"
+            self.use_async_scheduling
+            and self.num_spec_tokens
+            and self._draft_token_ids is None
+            or (
+                self.speculative_config is not None
+                and self.speculative_config.method == "ngram_gpu"
+            )
         ):
-                scheduler_output = replace(
-                    scheduler_output,
-                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens.copy(),
-                    scheduled_spec_decode_tokens=scheduler_output.scheduled_spec_decode_tokens.copy(),
-                )
-        
+            num_scheduled_tokens_copy = scheduler_output.num_scheduled_tokens.copy()
+            spec_decode_tokens_copy = (
+                scheduler_output.scheduled_spec_decode_tokens.copy()
+            )
+            scheduler_output = replace(
+                scheduler_output,
+                num_scheduled_tokens=num_scheduled_tokens_copy,
+                scheduled_spec_decode_tokens=spec_decode_tokens_copy,
+            )
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
 
         with self.synchronize_input_prep():
@@ -3187,9 +3185,7 @@ class GPUModelRunner(
                 if not has_kv_transfer_group():
                     # Return empty ModelRunnerOutput if no work to do.
                     return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(
-                    scheduler_output, self.vllm_config
-                )
+                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
                     "--kv-sharing-fast-prefill produces incorrect "
@@ -3203,7 +3199,6 @@ class GPUModelRunner(
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
-
 
             with record_function_or_nullcontext("gpu_model_runner: _prepare_inputs"):
                 (
@@ -3224,7 +3219,9 @@ class GPUModelRunner(
                     scheduler_output.num_common_prefix_blocks,
                 )
 
-            with record_function_or_nullcontext("gpu_model_runner: _determine_batch_execution_and_padding"):
+            with record_function_or_nullcontext(
+                "gpu_model_runner: _determine_batch_execution_and_padding"
+            ):
                 (
                     cudagraph_mode,
                     batch_desc,
@@ -3256,7 +3253,9 @@ class GPUModelRunner(
             use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
-            with record_function_or_nullcontext("gpu_model_runner: _build_attention_metadata"):
+            with record_function_or_nullcontext(
+                "gpu_model_runner: _build_attention_metadata"
+            ):
                 (attn_metadata, spec_decode_common_attn_metadata) = (
                     self._build_attention_metadata(
                         num_tokens=num_tokens_unpadded,
@@ -3284,25 +3283,6 @@ class GPUModelRunner(
                     scheduler_output, num_tokens_padded, intermediate_tensors
                 )
 
-            print("In execute_model::preprocess before correct_inputs_on_gpu parameters:")
-            print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
-            print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
-            print(f"\t\tinput_ids: {input_ids}")
-            print(f"\t\tpositions: {positions}")
-            print(f"\t\tself.positions.gpu: {self.positions.gpu}")
-            print(f"\t\tseq_lens: {self.seq_lens.gpu}")
-            print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
-            print(f"\t\tnum_reqs: {num_reqs}")
-            for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
-                blk_table = self.input_batch.block_table[kv_cache_gid]
-                blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-                slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
-                print(
-                    f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}"
-                )
-                print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
-            print(f"----------------------------------------------------------")
-
             # Apply GPU-side correction for positions, seq_lens, and slot_mapping
             # when using async scheduling with speculative decoding.
             # This corrects for rejected tokens from the previous step without
@@ -3313,10 +3293,14 @@ class GPUModelRunner(
             # and _draft_token_ids, which don't depend on num_computed_tokens.
             # Only positions, seq_lens, and slot_mapping need GPU correction.
             if self.use_gpu_input_correction:
-                with record_function_or_nullcontext("gpu_model_runner: correct_inputs_on_gpu"):
+                with record_function_or_nullcontext(
+                    "gpu_model_runner: correct_inputs_on_gpu"
+                ):
                     # Get the block table for the first KV cache group (main attention)
                     # For models with multiple KV cache groups, we correct all of them
-                    for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
+                    for kv_cache_gid, _ in enumerate(
+                        self.kv_cache_config.kv_cache_groups
+                    ):
                         blk_table = self.input_batch.block_table[kv_cache_gid]
                         blk_table_tensor = blk_table.get_device_tensor(num_reqs)
                         slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
@@ -3340,25 +3324,6 @@ class GPUModelRunner(
             cudagraph_mode = CUDAGraphMode.NONE
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
-
-        print("In execute_model::model_forward input parameters:")
-        print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
-        print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
-        print(f"\t\tinput_ids: {input_ids}")
-        print(f"\t\tpositions: {positions}")
-        print(f"\t\tself.positions.gpu: {self.positions.gpu}")
-        print(f"\t\tseq_lens: {self.seq_lens.gpu}")
-        print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
-        print(f"\t\tnum_reqs: {num_reqs}")
-        for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
-            blk_table = self.input_batch.block_table[kv_cache_gid]
-            blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-            slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
-            print(f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}")
-            print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
-        print(f"++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-        print(f"++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
-        print(f"++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
@@ -3866,7 +3831,8 @@ class GPUModelRunner(
         positions[:total_tokens].sub_(correction_per_token)
 
         # Recalculate slot_mapping based on corrected positions
-        # slot_mapping = block_table[req, pos // block_size] * block_size + pos % block_size
+        # slot_mapping =
+        #     block_table[req, pos // block_size] * block_size + pos % block_size
         corrected_positions = positions[:total_tokens]
         block_size = self.cache_config.block_size
         max_num_blocks = block_table.shape[1]
@@ -3895,11 +3861,6 @@ class GPUModelRunner(
         if not self.use_gpu_input_correction:
             return
 
-        # print(f"[_cache_valid_sampled_token_count_gpu] num_reqs={num_reqs}")
-        # print(
-        #     f"[_cache_valid_sampled_token_count_gpu] valid_sampled_tokens_count[:num_reqs]={valid_sampled_tokens_count[:num_reqs]}"
-        # )
-
         # Cache the valid counts on GPU
         self.cached_valid_sampled_token_count_gpu[:num_reqs].copy_(
             valid_sampled_tokens_count[:num_reqs], non_blocking=True
@@ -3923,18 +3884,10 @@ class GPUModelRunner(
         if prev_req_id_to_index is None:
             # First iteration, no previous batch
             self.curr_to_prev_idx_cpu[:num_reqs].fill_(-1)
-            # print(
-            #     "[_build_curr_to_prev_idx_mapping] First iteration, no previous batch"
-            # )
         else:
             for curr_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
                 prev_idx = prev_req_id_to_index.get(req_id, -1)
                 self.curr_to_prev_idx_cpu[curr_idx] = prev_idx
-
-        # print(f"[_build_curr_to_prev_idx_mapping] num_reqs={num_reqs}")
-        # print(
-        #     f"[_build_curr_to_prev_idx_mapping] curr_to_prev_idx_cpu[:num_reqs]={self.curr_to_prev_idx_cpu[:num_reqs]}"
-        # )
 
         # Copy to GPU (non-blocking, will be synchronized before use)
         self.curr_to_prev_idx_gpu[:num_reqs].copy_(
@@ -3965,15 +3918,6 @@ class GPUModelRunner(
         """
         if not self.use_gpu_input_correction:
             return
-
-        # scheduled_spec_tokens = scheduler_output.scheduled_spec_decode_tokens
-        # print(f"[_cache_prev_num_draft_len_gpu] num_reqs={num_reqs}")
-        # print(
-        #     f"[_cache_prev_num_draft_len_gpu] scheduled_spec_tokens keys={list(scheduled_spec_tokens.keys())}"
-        # )
-        # print(
-        #     f"[_cache_prev_num_draft_len_gpu] cached_prev_num_draft_len_gpu[:num_reqs]={self.cached_prev_num_draft_len_gpu[:num_reqs]}"
-        # )
 
         # Save current num_reqs for next iteration
         self.prev_num_reqs = num_reqs
@@ -4035,7 +3979,6 @@ class GPUModelRunner(
                 self._copy_valid_sampled_token_count(
                     next_token_ids, valid_sampled_tokens_count
                 )
-
 
             batch_size = next_token_ids.shape[0]
             max_new_tokens = valid_sampled_token_ids_gpu.shape[1]  # num_spec_tokens + 1
@@ -4237,7 +4180,9 @@ class GPUModelRunner(
 
             # Cache scheduler's spec_decode_tokens count for next step's correction
             if self.use_gpu_input_correction:
-                with record_function_or_nullcontext("gpu_model_runner: cache_prev_num_draft_len_gpu"):
+                with record_function_or_nullcontext(
+                    "gpu_model_runner: cache_prev_num_draft_len_gpu"
+                ):
                     self._cache_prev_num_draft_len_gpu(
                         scheduler_output, next_token_ids.shape[0]
                     )
