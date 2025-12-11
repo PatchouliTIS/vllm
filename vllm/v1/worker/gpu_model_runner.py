@@ -3284,23 +3284,24 @@ class GPUModelRunner(
                     scheduler_output, num_tokens_padded, intermediate_tensors
                 )
 
-            # print("In execute_model::preprocess before modify gpu input parameters:")
-            # print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
-            # print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
-            # print(f"\t\tinput_ids: {input_ids}")
-            # print(f"\t\tpositions: {positions}")
-            # print(f"\t\tself.positions.gpu: {self.positions.gpu}")
-            # print(f"\t\tseq_lens: {self.seq_lens.gpu}")
-            # print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
-            # print(f"\t\tnum_reqs: {num_reqs}")
-            # for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
-            #     blk_table = self.input_batch.block_table[kv_cache_gid]
-            #     blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-            #     slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
-            #     print(
-            #         f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}"
-            #     )
-            #     print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
+            print("In execute_model::preprocess before correct_inputs_on_gpu parameters:")
+            print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
+            print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
+            print(f"\t\tinput_ids: {input_ids}")
+            print(f"\t\tpositions: {positions}")
+            print(f"\t\tself.positions.gpu: {self.positions.gpu}")
+            print(f"\t\tseq_lens: {self.seq_lens.gpu}")
+            print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
+            print(f"\t\tnum_reqs: {num_reqs}")
+            for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
+                blk_table = self.input_batch.block_table[kv_cache_gid]
+                blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+                slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
+                print(
+                    f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}"
+                )
+                print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
+            print(f"----------------------------------------------------------")
 
             # Apply GPU-side correction for positions, seq_lens, and slot_mapping
             # when using async scheduling with speculative decoding.
@@ -3340,22 +3341,24 @@ class GPUModelRunner(
             # Mark KV scales as calculated after the first forward pass
             self.calculate_kv_scales = False
 
-        # print("In execute_model::model_forward input parameters:")
-        # print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
-        # print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
-        # print(f"\t\tinput_ids: {input_ids}")
-        # print(f"\t\tpositions: {positions}")
-        # print(f"\t\tself.positions.gpu: {self.positions.gpu}")
-        # print(f"\t\tseq_lens: {self.seq_lens.gpu}")
-        # print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
-        # print(f"\t\tnum_reqs: {num_reqs}")
-        # for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
-        #     blk_table = self.input_batch.block_table[kv_cache_gid]
-        #     blk_table_tensor = blk_table.get_device_tensor(num_reqs)
-        #     slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
-        #     print(f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}")
-        #     print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
-        # print("----------------------------------------------------------")
+        print("In execute_model::model_forward input parameters:")
+        print(f"\t\tnum_tokens_padded: {num_tokens_padded}")
+        print(f"\t\tnum_tokens_unpadded: {num_tokens_unpadded}")
+        print(f"\t\tinput_ids: {input_ids}")
+        print(f"\t\tpositions: {positions}")
+        print(f"\t\tself.positions.gpu: {self.positions.gpu}")
+        print(f"\t\tseq_lens: {self.seq_lens.gpu}")
+        print(f"\t\tself.query_start_loc.gpu: {self.query_start_loc.gpu}")
+        print(f"\t\tnum_reqs: {num_reqs}")
+        for kv_cache_gid, _ in enumerate(self.kv_cache_config.kv_cache_groups):
+            blk_table = self.input_batch.block_table[kv_cache_gid]
+            blk_table_tensor = blk_table.get_device_tensor(num_reqs)
+            slot_mapping = blk_table.slot_mapping.gpu[:num_tokens_unpadded]
+            print(f"\t\tblk_table{kv_cache_gid}: blk_table_tensor: {blk_table_tensor}")
+            print(f"\t\tblk_table{kv_cache_gid}: slot_mapping: {slot_mapping}")
+        print(f"++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        print(f"++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+        print(f"++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
 
         # Run the model.
         # Use persistent buffers for CUDA graphs.
