@@ -155,7 +155,7 @@ class InputProcessor:
             and (
                 params.frequency_penalty != 0.0
                 or params.presence_penalty != 0.0
-                or params.repetition_penalty != 1.0
+                # or params.repetition_penalty != 1.0
                 or params.bad_words_token_ids
                 or params.structured_outputs
             )

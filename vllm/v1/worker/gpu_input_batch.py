@@ -347,6 +347,8 @@ class InputBatch:
         self.num_computed_tokens_cpu[req_index] = request.num_computed_tokens
         self.block_table.add_row(request.block_ids, req_index)
 
+        # print(f"In input_batch::add_request:: request.sampling_params: {request.sampling_params}")
+
         if sampling_params := request.sampling_params:
             if self.is_spec_decode and is_spec_decode_unsupported(sampling_params):
                 self.spec_decode_unsupported_reqs.add(req_id)
@@ -936,9 +938,10 @@ class InputBatch:
             if sampled_token_ids is None:
                 assert self.async_copy_ready_event is not None
                 self.async_copy_ready_event.synchronize()
-                sampled_token_ids = self.sampled_token_ids_cpu.squeeze(-1).tolist()
-            # Replace placeholder token id with actual sampled id.
-            req_output_token_ids[-1] = sampled_token_ids[prev_index]
+                sampled_token_ids = self.sampled_token_ids_cpu.tolist()
+            # Replace placeholder token id(s) with actual sampled id(s).
+            if sampled_ids := sampled_token_ids[prev_index]:
+                req_output_token_ids[-len(sampled_ids) :] = sampled_ids
 
     @property
     def num_reqs(self) -> int:

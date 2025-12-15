@@ -605,6 +605,16 @@ class GPUModelRunner(
         self._is_empty_draft_tokens_copy_stream: torch.cuda.Stream = torch.cuda.Stream()
         # Number of requests copied in the async transfer
         self._is_empty_draft_tokens_copy_size: int = 0
+
+        self._draft_token_ids_event = torch.Event()
+        self._draft_token_ids_copy_stream = torch.cuda.Stream()
+        self._draft_token_ids_cpu = torch.empty(
+            (self.max_num_reqs, self.num_spec_tokens),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=self.pin_memory,
+        )
+
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
             (self.max_num_reqs, 1),
@@ -2815,14 +2825,40 @@ class GPUModelRunner(
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        self.input_batch.update_async_output_token_ids()
         if spec_decode_metadata is None:
             # Update output token ids with tokens sampled in last step
             # if async scheduling and required by current sampling params.
-            self.input_batch.update_async_output_token_ids()
             return self.sampler(
                 logits=logits,
                 sampling_metadata=sampling_metadata,
             )
+
+        # Update spec_token_ids from async CPU copy for penalty computation.
+        # Only update requests that actually have draft tokens according to
+        # spec_decode_metadata to maintain consistency.
+        if self.use_async_scheduling and not sampling_metadata.no_penalties:
+            self._draft_token_ids_event.synchronize()
+            num_reqs = self.input_batch.num_reqs
+            draft_cpu = self._draft_token_ids_cpu[:num_reqs]
+            spec_token_ids = sampling_metadata.spec_token_ids
+            num_draft_tokens = spec_decode_metadata.num_draft_tokens
+            assert spec_token_ids is not None
+            for i in range(num_reqs):
+                # Only update if this request has draft tokens in metadata.
+                if num_draft_tokens[i] > 0:
+                    row = draft_cpu[i]
+                    # Find first zero position and take tokens before it.
+                    zero_pos = (row == 0).int().argmax().item()
+                    # argmax returns 0 if no zeros or if first element is zero.
+                    if zero_pos == 0 and row[0] != 0:
+                        # No zeros found, all tokens valid.
+                        spec_token_ids[i] = row.tolist()
+                    else:
+                        spec_token_ids[i] = row[:zero_pos].tolist()
+                else:
+                    # Clear spec_token_ids for requests without draft tokens.
+                    spec_token_ids[i] = []
 
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
@@ -3576,6 +3612,20 @@ class GPUModelRunner(
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
                     )
+        
+        if (
+            self.use_async_scheduling
+            and self.num_spec_tokens > 0
+        ):
+            assert self._draft_token_ids is not None
+            assert isinstance(self._draft_token_ids, torch.Tensor)
+            default_stream = torch.cuda.current_stream()
+            with torch.cuda.stream(self._draft_token_ids_copy_stream):
+                self._draft_token_ids_copy_stream.wait_stream(default_stream)
+                self._draft_token_ids_cpu[: self._draft_token_ids.shape[0]].copy_(
+                    self._draft_token_ids, non_blocking=True
+                )
+                self._draft_token_ids_event.record()
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
