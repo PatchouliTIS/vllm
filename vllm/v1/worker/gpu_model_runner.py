@@ -606,14 +606,11 @@ class GPUModelRunner(
         # Number of requests copied in the async transfer
         self._is_empty_draft_tokens_copy_size: int = 0
 
-        self._draft_token_ids_event = torch.Event()
-        self._draft_token_ids_copy_stream = torch.cuda.Stream()
-        self._draft_token_ids_cpu = torch.empty(
-            (self.max_num_reqs, self.num_spec_tokens),
-            dtype=torch.int64,
-            device="cpu",
-            pin_memory=self.pin_memory,
-        )
+        self._draft_token_ids_event: torch.Event | None = None
+        self._draft_token_ids_copy_stream: torch.cuda.Stream | None = None
+        self._draft_token_ids_cpu: torch.Tensor | None = None
+        # Number of requests when draft_token_ids were copied to CPU
+        self._prev_num_reqs_for_draft: int = 0
 
         self.transfer_event = torch.Event()
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -630,6 +627,16 @@ class GPUModelRunner(
         if self.use_async_scheduling and self.num_spec_tokens:
             self.valid_sampled_token_count_event = torch.Event()
             self.valid_sampled_token_count_copy_stream = torch.cuda.Stream()
+            self._draft_token_ids_event = torch.Event()
+            self._draft_token_ids_copy_stream = torch.cuda.Stream()
+            self._draft_token_ids_cpu = torch.empty(
+                (self.max_num_reqs, self.num_spec_tokens),
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=self.pin_memory,
+            )
+            # Number of requests when draft_token_ids were copied to CPU
+            self._prev_num_reqs_for_draft: int = 0
         self.valid_sampled_token_count_cpu = torch.empty(
             self.max_num_reqs,
             dtype=torch.int64,
@@ -2834,20 +2841,32 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
             )
 
+        # TODO(patchy): reuse codes in https://github.com/vllm-project/vllm/pull/29821
         # Update spec_token_ids from async CPU copy for penalty computation.
         # Only update requests that actually have draft tokens according to
         # spec_decode_metadata to maintain consistency.
         if self.use_async_scheduling and not sampling_metadata.no_penalties:
             self._draft_token_ids_event.synchronize()
-            num_reqs = self.input_batch.num_reqs
-            draft_cpu = self._draft_token_ids_cpu[:num_reqs]
+            prev_num_reqs = self._prev_num_reqs_for_draft
+            draft_cpu = self._draft_token_ids_cpu[:prev_num_reqs]
             spec_token_ids = sampling_metadata.spec_token_ids
             num_draft_tokens = spec_decode_metadata.num_draft_tokens
+            prev_req_id_to_index = self.input_batch.prev_req_id_to_index
             assert spec_token_ids is not None
-            for i in range(num_reqs):
+            for i, req_id in enumerate(self.input_batch.req_ids):
                 # Only update if this request has draft tokens in metadata.
                 if num_draft_tokens[i] > 0:
-                    row = draft_cpu[i]
+                    # Use prev_req_id_to_index for correct request mapping
+                    prev_index = (
+                        prev_req_id_to_index.get(req_id)
+                        if prev_req_id_to_index is not None
+                        else None
+                    )
+                    if prev_index is None or prev_index >= prev_num_reqs:
+                        # New request or index out of range, skip
+                        spec_token_ids[i] = []
+                        continue
+                    row = draft_cpu[prev_index]
                     # Find first zero position and take tokens before it.
                     zero_pos = (row == 0).int().argmax().item()
                     # argmax returns 0 if no zeros or if first element is zero.
@@ -3612,20 +3631,23 @@ class GPUModelRunner(
                     self._copy_valid_sampled_token_count(
                         next_token_ids, valid_sampled_tokens_count
                     )
-        
-        if (
-            self.use_async_scheduling
-            and self.num_spec_tokens > 0
-        ):
-            assert self._draft_token_ids is not None
-            assert isinstance(self._draft_token_ids, torch.Tensor)
-            default_stream = torch.cuda.current_stream()
-            with torch.cuda.stream(self._draft_token_ids_copy_stream):
-                self._draft_token_ids_copy_stream.wait_stream(default_stream)
-                self._draft_token_ids_cpu[: self._draft_token_ids.shape[0]].copy_(
-                    self._draft_token_ids, non_blocking=True
-                )
-                self._draft_token_ids_event.record()
+
+        # TODO(patchy): reuse codes in https://github.com/vllm-project/vllm/pull/29821
+        if self.use_async_scheduling and self.num_spec_tokens > 0:
+            with record_function_or_nullcontext(
+                "gpu_model_runner: draft_token_ids_copy_to_cpu"
+            ):
+                assert self._draft_token_ids is not None
+                assert isinstance(self._draft_token_ids, torch.Tensor)
+                default_stream = torch.cuda.current_stream()
+                with torch.cuda.stream(self._draft_token_ids_copy_stream):
+                    self._draft_token_ids_copy_stream.wait_stream(default_stream)
+                    self._draft_token_ids_cpu[: self._draft_token_ids.shape[0]].copy_(
+                        self._draft_token_ids, non_blocking=True
+                    )
+                    self._draft_token_ids_event.record()
+                # Save num_reqs for correct indexing in next step
+                self._prev_num_reqs_for_draft = self.input_batch.num_reqs
 
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
@@ -4081,7 +4103,10 @@ class GPUModelRunner(
 
             # Cache scheduler's spec_decode_tokens count for next step's correction
             if self.use_gpu_input_correction:
-                self._cache_prev_num_draft_len_gpu(scheduler_output, batch_size)
+                with record_function_or_nullcontext(
+                    "gpu_model_runner: cache_prev_num_draft_len_gpu"
+                ):
+                    self._cache_prev_num_draft_len_gpu(scheduler_output, batch_size)
         elif spec_config.method == "suffix":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, SuffixDecodingProposer)
