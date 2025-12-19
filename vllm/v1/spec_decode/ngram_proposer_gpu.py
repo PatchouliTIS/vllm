@@ -5,7 +5,13 @@ GPU-accelerated N-gram proposer using fully async PyTorch tensor operations.
 
 This version uses a fully vectorized approach with unfold and argmax for
 finding the first match across all sequences in parallel.
+
+Optionally supports Triton kernels for improved performance.
 """
+
+# Environment variable to control implementation choice
+# Set VLLM_NGRAM_USE_TRITON=1 to use Triton kernels
+import os
 
 import torch
 from torch import nn
@@ -16,7 +22,10 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.forward_context import set_forward_context
+from vllm.v1.spec_decode.utils import ngram_propose_triton
 from vllm.v1.worker.gpu_input_batch import InputBatch
+
+_USE_TRITON = os.environ.get("VLLM_NGRAM_USE_TRITON", "0") == "1"
 
 
 @support_torch_compile()
@@ -95,6 +104,39 @@ class NgramGPUKernel(nn.Module):
         Returns:
             Draft token predictions, -1 for invalid/no-match positions
                 Shape: [batch_size, num_draft_tokens]
+        """
+        # Use Triton implementation if enabled
+        if _USE_TRITON:
+            return ngram_propose_triton(
+                token_ids,
+                seq_lengths,
+                min_ngram_len,
+                max_ngram_len,
+                num_draft_tokens,
+            )
+
+        # PyTorch implementation (default)
+        return self._find_first_and_extract_pytorch(
+            token_ids,
+            seq_lengths,
+            min_ngram_len,
+            max_ngram_len,
+            num_draft_tokens,
+        )
+
+    def _find_first_and_extract_pytorch(
+        self,
+        token_ids: torch.Tensor,
+        seq_lengths: torch.Tensor,
+        min_ngram_len: int,
+        max_ngram_len: int,
+        num_draft_tokens: int,
+    ) -> torch.Tensor:
+        """
+        PyTorch implementation of n-gram matching and extraction.
+
+        This is the default implementation using vectorized PyTorch operations.
+        See _find_first_and_extract_all_n_parallel for detailed documentation.
         """
         batch_size = token_ids.shape[0]
         max_seq_len = token_ids.shape[1]
