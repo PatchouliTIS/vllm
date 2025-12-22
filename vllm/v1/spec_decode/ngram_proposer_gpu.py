@@ -19,11 +19,14 @@ from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CompilationConfig,
+    CompilationMode,
+    CUDAGraphMode,
     VllmConfig,
 )
 from vllm.forward_context import set_forward_context
 from vllm.v1.spec_decode.utils import ngram_propose_triton
 from vllm.v1.worker.gpu_input_batch import InputBatch
+from vllm.v1.utils import record_function_or_nullcontext
 
 _USE_TRITON = os.environ.get("VLLM_NGRAM_USE_TRITON", "0") == "1"
 
@@ -310,7 +313,7 @@ class NgramProposerGPU:
         assert vllm_config.speculative_config.prompt_lookup_max is not None
 
         compilation_config = CompilationConfig(
-            level=3,
+            mode=CompilationMode.VLLM_COMPILE,
             custom_ops=["none"],
             splitting_ops=[],
             compile_sizes=[],
@@ -322,7 +325,7 @@ class NgramProposerGPU:
                 "coordinate_descent_tuning": True,
                 "use_mixed_mm": False,
             },
-            use_cudagraph=False,
+            cudagraph_mode=CUDAGraphMode.NONE,
         )
 
         self.vllm_config = VllmConfig(compilation_config=compilation_config)

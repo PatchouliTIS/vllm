@@ -211,12 +211,9 @@ def ngram_find_matches_kernel(
     first_match = max_seq_len
 
     # Search through all positions in blocks
-    # We iterate from position 0 upward; the first True in argmax order
+    # Note: Triton does not support `break` statements, so we process all blocks
+    # and use tl.minimum to track the earliest match position.
     for block_start in tl.range(0, max_seq_len, BLOCK_SIZE_POS):
-        # Early exit if we already found a match in an earlier block
-        if first_match < block_start:
-            break
-
         # Positions in this block
         pos_offs = tl.arange(0, BLOCK_SIZE_POS)
         positions = block_start + pos_offs

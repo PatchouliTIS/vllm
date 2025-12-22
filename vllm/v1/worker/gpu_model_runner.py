@@ -844,7 +844,9 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
-    def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
+    def _update_states(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[tuple[str, int, int]]:
         """Update the cached states and the persistent batch with the scheduler
         output.
 
@@ -853,6 +855,11 @@ class GPUModelRunner(
 
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
+
+        Returns:
+            List of (req_id, req_index, num_spec_tokens) for requests that need
+            empty draft token checking. This is used by
+            _update_scheduler_for_empty_drafts() to defer the sync point.
         """
         # For GPU correction: swap the double buffers.
         # prev_prev_num_draft_len_gpu now holds the values from the previous step
@@ -997,7 +1004,10 @@ class GPUModelRunner(
             # GPU correction path: skip CPU sync, use empty list
             valid_sampled_token_count = []
 
-        is_empty_draft_tokens_cpu = self._is_empty_draft_tokens_cpu
+        # Collect requests that need empty draft token checking.
+        # The actual sync and scheduler_output update is deferred to
+        # _update_scheduler_for_empty_drafts() to avoid kernel bubbles.
+        pending_empty_draft_checks: list[tuple[str, int, int]] = []
 
         # Collect indices and values for batch updating cached_prev_num_draft_len_gpu
         # to avoid per-request HtoD synchronization
@@ -1123,17 +1133,10 @@ class GPUModelRunner(
             )
             num_spec_tokens = len(spec_token_ids)
 
-            # Use pre-copied CPU tensor to avoid per-request DtoH sync
-            is_empty_draft_tokens = (
-                is_empty_draft_tokens_cpu is not None
-                and req_index is not None
-                and is_empty_draft_tokens_cpu[req_index].item()
-            )
-
             # For async scheduling, token_ids_cpu assigned from
             # spec_token_ids are placeholders and will be overwritten in
-            # _prepare_input_ids.
-            if num_spec_tokens and not is_empty_draft_tokens:
+            # _prepare_input_ids. Write unconditionally here.
+            if num_spec_tokens:
                 start_index = self.input_batch.num_tokens_no_spec[req_index]
                 end_token_index = start_index + num_spec_tokens
                 self.input_batch.token_ids_cpu[
@@ -1166,14 +1169,19 @@ class GPUModelRunner(
                         num_spec_tokens
                     )
                     draft_len_update_count += 1
-                if (
-                    num_spec_tokens
-                    and self._draft_token_ids is None
-                    or is_empty_draft_tokens
-                ):
-                    scheduler_output.total_num_scheduled_tokens -= num_spec_tokens
-                    scheduler_output.num_scheduled_tokens[req_id] -= num_spec_tokens
-                    scheduler_output.scheduled_spec_decode_tokens.pop(req_id, None)
+                # Defer scheduler_output update: collect requests for later check
+                # The sync for is_empty_draft_tokens happens after _update_states
+                if num_spec_tokens:
+                    if self._draft_token_ids is None:
+                        # _draft_token_ids is None means no valid draft tokens
+                        scheduler_output.total_num_scheduled_tokens -= num_spec_tokens
+                        scheduler_output.num_scheduled_tokens[req_id] -= num_spec_tokens
+                        scheduler_output.scheduled_spec_decode_tokens.pop(req_id, None)
+                    elif req_index is not None:
+                        # Collect for deferred is_empty_draft_tokens check
+                        pending_empty_draft_checks.append(
+                            (req_id, req_index, num_spec_tokens)
+                        )
 
         # Batch update cached_prev_num_draft_len_gpu after the loop
         # to avoid per-request HtoD synchronization
@@ -1210,6 +1218,8 @@ class GPUModelRunner(
         # prev_req_id_to_index information
         if use_gpu_correction:
             self._build_curr_to_prev_idx_mapping(self.input_batch.num_reqs)
+
+        return pending_empty_draft_checks
 
     def _update_ngram_gpu_tensors_incremental(
         self,
@@ -1575,6 +1585,36 @@ class GPUModelRunner(
         encoder_seq_lens_cpu = self.encoder_seq_lens.np[:num_reqs]
 
         return encoder_seq_lens, encoder_seq_lens_cpu
+
+    def _update_scheduler_for_empty_drafts(
+        self,
+        scheduler_output: "SchedulerOutput",
+        pending_checks: list[tuple[str, int, int]],
+    ) -> None:
+        """Update scheduler_output for requests with empty draft tokens.
+
+        This method is called between _update_states and _prepare_inputs to
+        defer the sync point for is_empty_draft_tokens. By delaying the sync,
+        the async D2H copy has more time to complete, reducing kernel bubbles.
+
+        Args:
+            scheduler_output: The scheduler output to update.
+            pending_checks: List of (req_id, req_index, num_spec_tokens) tuples
+                for requests that need is_empty_draft_tokens checking.
+        """
+        if not pending_checks:
+            return
+
+        # Sync the is_empty_draft_tokens copy (should be complete by now)
+        # self._is_empty_draft_tokens_event.synchronize()
+        is_empty_draft_tokens_cpu = self._is_empty_draft_tokens_cpu
+
+        for req_id, req_index, num_spec_tokens in pending_checks:
+            # Check if this request has empty/invalid draft tokens
+            if is_empty_draft_tokens_cpu[req_index].item():
+                scheduler_output.total_num_scheduled_tokens -= num_spec_tokens
+                scheduler_output.num_scheduled_tokens[req_id] -= num_spec_tokens
+                scheduler_output.scheduled_spec_decode_tokens.pop(req_id, None)
 
     def _prepare_inputs(
         self,
@@ -3322,7 +3362,7 @@ class GPUModelRunner(
 
         with self.synchronize_input_prep():
             # Update persistent batch states.
-            self._update_states(scheduler_output)
+            pending_empty_draft_checks = self._update_states(scheduler_output)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -3358,6 +3398,13 @@ class GPUModelRunner(
 
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
+
+            # Update scheduler_output for empty draft tokens (deferred sync point)
+            # This must be done before reading num_scheduled_tokens
+            self._update_scheduler_for_empty_drafts(
+                scheduler_output, pending_empty_draft_checks
+            )
+
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
@@ -3919,7 +3966,7 @@ class GPUModelRunner(
             self._is_empty_draft_tokens_cpu[:num_reqs_to_copy].copy_(
                 is_empty_draft_tokens[:num_reqs_to_copy], non_blocking=True
             )
-            self._is_empty_draft_tokens_event.record()
+            # self._is_empty_draft_tokens_event.record()
 
         self._is_empty_draft_tokens_copy_size = num_reqs_to_copy
 
