@@ -24,10 +24,9 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.forward_context import set_forward_context
-from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.spec_decode.utils import ngram_propose_triton
-from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker.gpu_input_batch import InputBatch
 
 _USE_TRITON = os.environ.get("VLLM_NGRAM_USE_TRITON", "0") == "1"
 

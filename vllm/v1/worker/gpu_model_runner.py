@@ -9,7 +9,6 @@ from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from copy import copy, deepcopy
-from dataclasses import replace
 from functools import reduce
 from itertools import product
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
@@ -1082,7 +1081,9 @@ class GPUModelRunner(
         # _update_scheduler_for_empty_drafts() to avoid kernel bubbles.
         pending_empty_draft_checks: list[tuple[str, int, int]] = []
 
-        from fpdb import ForkedPdb; ForkedPdb().set_trace()
+        from fpdb import ForkedPdb
+
+        ForkedPdb().set_trace()
 
         # Collect indices and values for batch updating cached_prev_num_draft_len_gpu
         # to avoid per-request HtoD synchronization
