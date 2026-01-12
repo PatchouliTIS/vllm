@@ -24,6 +24,7 @@ from vllm.config import (
     VllmConfig,
 )
 from vllm.forward_context import set_forward_context
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.spec_decode.utils import ngram_propose_triton
 from vllm.v1.worker.gpu_input_batch import InputBatch
 from vllm.v1.utils import record_function_or_nullcontext
@@ -48,10 +49,14 @@ class NgramGPUKernel(nn.Module):
        - torch.compile generates specialized kernels for different shapes
 
     3. Graph Compilation:
-       - Uses fullgraph=True mode for maximum optimization
-       - All operations are tensor-based (no Python loops or conditionals
-            that depend on input values)
-       - The entire forward pass is compiled into a single CUDA graph
+       - Note: fullgraph=True does NOT mean the forward pass runs as a single
+         CUDA Graph. nsys profiling shows ~5 separate Triton kernel launches.
+         torch.compile with fullgraph=True ensures complete Dynamo tracing
+         without fallbacks, but Inductor still generates multiple kernels.
+       - CUDA Graph capture is disabled (cudagraph_mode=NONE) for this module
+         because: (1) the kernel launch overhead is minimal compared to the
+         actual computation, and (2) the n-gram matching workload is simple
+         enough that CUDA Graph capture would be overkill with little benefit.
     """
 
     def __init__(
@@ -327,8 +332,16 @@ class NgramProposerGPU:
             },
             cudagraph_mode=CUDAGraphMode.NONE,
         )
+        model_config = vllm_config.model_config
+        speculative_config = vllm_config.speculative_config
+        scheduler_config = vllm_config.scheduler_config
 
-        self.vllm_config = VllmConfig(compilation_config=compilation_config)
+        self.vllm_config = VllmConfig(
+            compilation_config=compilation_config,
+            model_config=model_config,
+            speculative_config=speculative_config,
+            scheduler_config=scheduler_config,
+        )
 
         self.min_n = vllm_config.speculative_config.prompt_lookup_min
         self.max_n = vllm_config.speculative_config.prompt_lookup_max
@@ -337,9 +350,8 @@ class NgramProposerGPU:
         self.max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self.vocab_size = vllm_config.model_config.get_vocab_size()
         self.device = device
-
         self.kernel = NgramGPUKernel(
-            vllm_config=vllm_config, prefix="ngram_gpu_kernel", device=device
+            vllm_config=self.vllm_config, prefix="ngram_gpu_kernel", device=device
         )
         self.device = device
         self.kernel.to(device)
@@ -408,7 +420,6 @@ class NgramProposerGPU:
         token_ids_gpu: torch.Tensor,  # [batch_size, max_len]
         valid_sampled_token_ids_gpu: torch.Tensor,  # [batch_size, num_spec_tokens + 1]
         valid_sampled_tokens_count: torch.Tensor,  # [batch_size]
-        spec_decode_unsupported_indices: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Propose draft tokens using GPU-accelerated n-gram matching.
@@ -424,8 +435,6 @@ class NgramProposerGPU:
             token_ids_gpu: Token IDs tensor (modified in-place with new tokens)
             valid_sampled_token_ids_gpu: Newly sampled tokens to scatter
             valid_sampled_tokens_count: Count of valid tokens per sequence
-            spec_decode_unsupported_indices: Indices of requests that don't
-                support speculative decoding
 
         Returns:
             draft_tokens: Proposed draft token IDs [batch_size, k]
@@ -463,19 +472,17 @@ class NgramProposerGPU:
         sampled_flags = valid_sampled_tokens_count > 0
         valid_mask = torch.ones(batch_size, dtype=torch.bool, device=self.device)
 
-        if spec_decode_unsupported_indices:
-            valid_mask[spec_decode_unsupported_indices] = False
-
         with set_forward_context(None, self.vllm_config):
             combined_mask = (
                 sampled_flags & valid_mask & (num_tokens_no_spec >= self.min_n)
             )
 
-            draft_tokens, is_empty_draft_tokens = self.kernel(
-                num_tokens_no_spec,
-                token_ids_gpu,
-                combined_mask,
-            )
+            with record_function_or_nullcontext("ngram_proposer_gpu: kernel"):
+                draft_tokens, is_empty_draft_tokens = self.kernel(
+                    num_tokens_no_spec,
+                    token_ids_gpu,
+                    combined_mask,
+                )
 
             return draft_tokens, is_empty_draft_tokens
 
