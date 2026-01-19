@@ -1081,10 +1081,6 @@ class GPUModelRunner(
         # _update_scheduler_for_empty_drafts() to avoid kernel bubbles.
         pending_empty_draft_checks: list[tuple[str, int, int]] = []
 
-        from fpdb import ForkedPdb
-
-        ForkedPdb().set_trace()
-
         # Collect indices and values for batch updating cached_prev_num_draft_len_gpu
         # to avoid per-request HtoD synchronization
         draft_len_update_count = 0
@@ -3117,11 +3113,6 @@ class GPUModelRunner(
         dict[str, int],
         list[int],
     ]:
-        # Async copy is_empty_draft_tokens to CPU using dedicated stream
-        self._copy_is_empty_draft_tokens(
-            self._is_empty_draft_tokens, self.input_batch.num_reqs
-        )
-
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
@@ -3537,11 +3528,14 @@ class GPUModelRunner(
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
 
-            # Update scheduler_output for empty draft tokens (deferred sync point)
-            # This must be done before reading num_scheduled_tokens
-            self._update_scheduler_for_empty_drafts(
-                scheduler_output, pending_empty_draft_checks
-            )
+            with record_function_or_nullcontext(
+                "gpu_model_runner: update_scheduler_for_empty_drafts"
+            ):
+                # Update scheduler_output for empty draft tokens (deferred sync point)
+                # This must be done before reading num_scheduled_tokens
+                self._update_scheduler_for_empty_drafts(
+                    scheduler_output, pending_empty_draft_checks
+                )
 
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
@@ -4395,6 +4389,11 @@ class GPUModelRunner(
             )
 
             self._is_empty_draft_tokens = is_empty_draft_tokens
+
+            # Async copy is_empty_draft_tokens to CPU using dedicated stream
+            self._copy_is_empty_draft_tokens(
+                self._is_empty_draft_tokens, self.input_batch.num_reqs
+            )
 
             # Cache scheduler's spec_decode_tokens count for next step's correction
             if self.use_gpu_input_correction:
