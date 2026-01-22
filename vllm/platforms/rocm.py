@@ -188,6 +188,17 @@ class RocmPlatform(Platform):
         supported_quantization += ["bitsandbytes"]
 
     @classmethod
+    def import_kernels(cls) -> None:
+        """Import ROCm-specific kernels."""
+        super().import_kernels()
+
+        import contextlib
+
+        # Import ROCm-specific extension
+        with contextlib.suppress(ImportError):
+            import vllm._rocm_C  # noqa: F401
+
+    @classmethod
     def get_attn_backend_cls(
         cls,
         selected_backend: "AttentionBackendEnum",
@@ -468,6 +479,9 @@ class RocmPlatform(Platform):
             and "-grouped_topk" not in compilation_config.custom_ops
         ):
             compilation_config.custom_ops.append("+grouped_topk")
+
+        # Default dispatch to rocm's sparse_attn_indexer implementation
+        compilation_config.custom_ops.append("+sparse_attn_indexer")
 
     @classmethod
     def verify_model_arch(cls, model_arch: str) -> None:
