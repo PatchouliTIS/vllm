@@ -342,6 +342,10 @@ _MULTIMODAL_MODELS = {
         "ernie45_vl",
         "Ernie4_5_VLMoeForConditionalGeneration",
     ),
+    "FireRedASRForConditionalGeneration": (
+        "fireredasr",
+        "FireRedASRForConditionalGeneration",
+    ),
     "FireRedASR2ForConditionalGeneration": (
         "fireredasr2",
         "FireRedASR2ForConditionalGeneration",
