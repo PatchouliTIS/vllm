@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
 from collections.abc import Iterable
 from functools import partial
 
@@ -18,15 +19,10 @@ from vllm.model_executor.models.deepseek_v2 import (
     DeepseekV2DecoderLayer,
     DeepseekV2Model,
 )
-from vllm.model_executor.models.interfaces import MultiModalEmbeddings
 from vllm.model_executor.models.mistral_large_3 import MistralLarge3ForCausalLM
-from vllm.multimodal.inputs import NestedTensors
 
-from .utils import (
-    _merge_multimodal_embeddings,
-    make_empty_intermediate_tensors_factory,
-    maybe_prefix,
-)
+from .interfaces import SupportsMultiModal
+from .utils import make_empty_intermediate_tensors_factory, maybe_prefix
 
 logger = init_logger(__name__)
 
@@ -38,7 +34,9 @@ class EagleMistralLarge3Model(DeepseekV2Model):
     ):
         nn.Module.__init__(self)
 
-        config = vllm_config.model_config.hf_config
+        config = copy.deepcopy(vllm_config.model_config.hf_config)
+        config.first_k_dense_replace += start_layer_id
+
         quant_config = vllm_config.quant_config
         self.config = config
         self.vllm_config = vllm_config
@@ -58,6 +56,7 @@ class EagleMistralLarge3Model(DeepseekV2Model):
                 DeepseekV2DecoderLayer(
                     vllm_config=vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{i + start_layer_id}"),
+                    config=config,
                 )
                 for i in range(self.config.num_hidden_layers)
             ]
@@ -72,8 +71,10 @@ class EagleMistralLarge3Model(DeepseekV2Model):
             input_is_parallel=False,
             quant_config=quant_config,
             return_bias=False,
+            prefix=maybe_prefix(prefix, "fc"),
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
@@ -117,26 +118,10 @@ class EagleMistralLarge3ForCausalLM(MistralLarge3ForCausalLM):
         )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
 
-    def get_input_embeddings(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: MultiModalEmbeddings | None = None,
-        *,
-        is_multimodal: torch.Tensor | None = None,
-        handle_oov_mm_token: bool = False,
-    ) -> torch.Tensor:
-        inputs_embeds = super().embed_input_ids(input_ids)
+    def get_language_model(self) -> torch.nn.Module:
+        return self.model
 
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            return inputs_embeds
-
-        assert is_multimodal is not None
-
-        return _merge_multimodal_embeddings(
-            inputs_embeds=inputs_embeds,
-            multimodal_embeddings=multimodal_embeddings,
-            is_multimodal=is_multimodal,
-        )
+    embed_input_ids = SupportsMultiModal.embed_input_ids  # type: ignore
 
     def forward(
         self,
@@ -155,11 +140,3 @@ class EagleMistralLarge3ForCausalLM(MistralLarge3ForCausalLM):
             "model.embed_tokens.weight",
             "lm_head.weight",
         }
-
-    def embed_input_ids(
-        self,
-        input_ids: torch.Tensor,
-        multimodal_embeddings: NestedTensors | None = None,
-        is_multimodal: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        return self.model.embed_input_ids(input_ids)

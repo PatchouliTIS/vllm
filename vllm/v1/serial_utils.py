@@ -8,7 +8,7 @@ from collections.abc import Callable, Sequence
 from functools import partial
 from inspect import isclass
 from types import FunctionType
-from typing import Any, TypeAlias, get_type_hints
+from typing import Any, ClassVar, TypeAlias, cast, get_type_hints
 
 import cloudpickle
 import msgspec
@@ -27,7 +27,6 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalFieldElem,
     MultiModalFlatField,
-    MultiModalKwargs,
     MultiModalKwargsItem,
     MultiModalKwargsItems,
     MultiModalSharedField,
@@ -176,9 +175,6 @@ class MsgpackEncoder:
         if isinstance(obj, MultiModalKwargsItems):
             return self._encode_mm_items(obj)
 
-        if isinstance(obj, MultiModalKwargs):
-            return self._encode_mm_kwargs(obj)
-
         if isinstance(obj, UtilityResult):
             result = obj.result
             if not envs.VLLM_ALLOW_INSECURE_SERIALIZATION:
@@ -246,22 +242,15 @@ class MsgpackEncoder:
             for modality, itemlist in items.items()
         }
 
-    def _encode_mm_item(self, item: MultiModalKwargsItem) -> list[dict[str, Any]]:
-        return [self._encode_mm_field_elem(elem) for elem in item.values()]
+    def _encode_mm_item(self, item: MultiModalKwargsItem) -> dict[str, Any]:
+        return {key: self._encode_mm_field_elem(elem) for key, elem in item.items()}
 
     def _encode_mm_field_elem(self, elem: MultiModalFieldElem) -> dict[str, Any]:
         return {
-            "modality": elem.modality,
-            "key": elem.key,
             "data": (
                 None if elem.data is None else self._encode_nested_tensors(elem.data)
             ),
             "field": self._encode_mm_field(elem.field),
-        }
-
-    def _encode_mm_kwargs(self, kw: MultiModalKwargs) -> dict[str, Any]:
-        return {
-            modality: self._encode_nested_tensors(data) for modality, data in kw.items()
         }
 
     def _encode_nested_tensors(self, nt: NestedTensors) -> Any:
@@ -278,10 +267,11 @@ class MsgpackEncoder:
         name = MMF_CLASS_TO_FACTORY.get(field.__class__)
         if not name:
             raise TypeError(f"Unsupported field type: {field.__class__}")
+
         # We just need to copy all of the field values in order
         # which will be then used to reconstruct the field.
-        field_values = (getattr(field, f.name) for f in dataclasses.fields(field))
-        return name, *field_values
+        factory_kw = {f.name: getattr(field, f.name) for f in dataclasses.fields(field)}
+        return name, factory_kw
 
 
 class MsgpackDecoder:
@@ -325,8 +315,6 @@ class MsgpackDecoder:
                 return self._decode_mm_item(obj)
             if issubclass(t, MultiModalKwargsItems):
                 return self._decode_mm_items(obj)
-            if issubclass(t, MultiModalKwargs):
-                return self._decode_mm_kwargs(obj)
             if t is UtilityResult:
                 return self._decode_utility_result(obj)
         return obj
@@ -393,9 +381,9 @@ class MsgpackDecoder:
             }
         )
 
-    def _decode_mm_item(self, obj: list[Any]) -> MultiModalKwargsItem:
-        return MultiModalKwargsItem.from_elems(
-            [self._decode_mm_field_elem(v) for v in obj]
+    def _decode_mm_item(self, obj: dict[str, Any]) -> MultiModalKwargsItem:
+        return MultiModalKwargsItem(
+            {key: self._decode_mm_field_elem(elem) for key, elem in obj.items()}
         )
 
     def _decode_mm_field_elem(self, obj: dict[str, Any]) -> MultiModalFieldElem:
@@ -403,24 +391,16 @@ class MsgpackDecoder:
             obj["data"] = self._decode_nested_tensors(obj["data"])
 
         # Reconstruct the field processor using MultiModalFieldConfig
-        factory_meth_name, *field_args = obj["field"]
+        factory_meth_name, factory_kw = obj["field"]
         factory_meth = getattr(MultiModalFieldConfig, factory_meth_name)
 
         # Special case: decode the union "slices" field of
         # MultiModalFlatField
         if factory_meth_name == "flat":
-            field_args[0] = self._decode_nested_slices(field_args[0])
+            factory_kw["slices"] = self._decode_nested_slices(factory_kw["slices"])
 
-        obj["field"] = factory_meth(None, *field_args).field
+        obj["field"] = factory_meth("", **factory_kw).field
         return MultiModalFieldElem(**obj)
-
-    def _decode_mm_kwargs(self, obj: dict[str, Any]) -> MultiModalKwargs:
-        return MultiModalKwargs(
-            {
-                modality: self._decode_nested_tensors(data)
-                for modality, data in obj.items()
-            }
-        )
 
     def _decode_nested_tensors(self, obj: Any) -> NestedTensors:
         if isinstance(obj, (int, float)):
@@ -480,6 +460,19 @@ def run_method(
 
 
 class PydanticMsgspecMixin:
+    """Make a ``msgspec.Struct`` compatible with Pydantic for both
+    **validation** (JSON/dict -> Struct) and **serialization**
+    (Struct -> JSON-safe dict).
+
+    Subclasses may set ``__pydantic_msgspec_exclude__`` (a ``set[str]``)
+    to list non-underscore field names that should also be stripped from
+    serialized output.  Fields whose names start with ``_`` are always
+    excluded automatically.
+    """
+
+    # Subclasses can override to exclude additional public-but-internal keys.
+    __pydantic_msgspec_exclude__: ClassVar[set[str]] = set()
+
     @classmethod
     def __get_pydantic_core_schema__(
         cls, source_type: Any, handler: GetCoreSchemaHandler
@@ -496,30 +489,60 @@ class PydanticMsgspecMixin:
         # Build the Pydantic typed_dict_field for each msgspec field
         fields = {}
         for name, hint in type_hints.items():
+            if name not in msgspec_fields:
+                # Skip ClassVar and other non-struct annotations.
+                continue
+            # Skip private fields — they are excluded from serialization
+            # and should not appear in the generated JSON/OpenAPI schema.
+            if name.startswith("_"):
+                continue
             msgspec_field = msgspec_fields[name]
 
             # typed_dict_field using the handler to get the schema
             field_schema = handler(hint)
 
             # Add default value to the schema.
+            # Mark fields with defaults as not required so the generated
+            # JSON Schema stays consistent with ``omit_defaults=True``
+            # serialization (fields at their default value may be absent).
             if msgspec_field.default_factory is not msgspec.NODEFAULT:
                 wrapped_schema = core_schema.with_default_schema(
                     schema=field_schema,
                     default_factory=msgspec_field.default_factory,
                 )
-                fields[name] = core_schema.typed_dict_field(wrapped_schema)
+                fields[name] = core_schema.typed_dict_field(
+                    wrapped_schema, required=False
+                )
             elif msgspec_field.default is not msgspec.NODEFAULT:
                 wrapped_schema = core_schema.with_default_schema(
                     schema=field_schema,
                     default=msgspec_field.default,
                 )
-                fields[name] = core_schema.typed_dict_field(wrapped_schema)
+                fields[name] = core_schema.typed_dict_field(
+                    wrapped_schema, required=False
+                )
             else:
                 # No default, so Pydantic will treat it as required
                 fields[name] = core_schema.typed_dict_field(field_schema)
-        return core_schema.no_info_after_validator_function(
+        typed_dict_then_convert = core_schema.no_info_after_validator_function(
             cls._validate_msgspec,
             core_schema.typed_dict_schema(fields),
+        )
+
+        # Build a serializer that strips private / excluded fields.
+        serializer = core_schema.plain_serializer_function_ser_schema(
+            cls._serialize_msgspec,
+            info_arg=False,
+        )
+
+        # Accept either an already-constructed msgspec.Struct instance or a
+        # JSON/dict-like payload.
+        return core_schema.union_schema(
+            [
+                core_schema.is_instance_schema(source_type),
+                typed_dict_then_convert,
+            ],
+            serialization=serializer,
         )
 
     @classmethod
@@ -530,3 +553,25 @@ class PydanticMsgspecMixin:
         if isinstance(value, dict):
             return cls(**value)
         return msgspec.convert(value, type=cls)
+
+    @staticmethod
+    def _serialize_msgspec(value: Any) -> Any:
+        """Serialize a msgspec.Struct to a JSON-compatible dict, stripping
+        private (``_``-prefixed) and explicitly excluded fields.
+
+        Uses ``msgspec.to_builtins`` which respects ``omit_defaults=True``,
+        so only fields that differ from their declared defaults are included.
+        """
+        raw = msgspec.to_builtins(value)
+        if not isinstance(raw, dict):
+            return raw
+
+        exclude: set[str] = cast(
+            set[str],
+            getattr(type(value), "__pydantic_msgspec_exclude__", set()),
+        )
+        for key in list(raw):
+            if key.startswith("_") or key in exclude:
+                del raw[key]
+
+        return raw

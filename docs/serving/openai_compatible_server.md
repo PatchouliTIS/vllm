@@ -47,6 +47,8 @@ We currently support the following OpenAI APIs:
 - [Completions API](#completions-api) (`/v1/completions`)
     - Only applicable to [text generation models](../models/generative_models.md).
     - *Note: `suffix` parameter is not supported.*
+- [Responses API](#responses-api) (`/v1/responses`)
+    - Only applicable to [text generation models](../models/generative_models.md).
 - [Chat Completions API](#chat-api) (`/v1/chat/completions`)
     - Only applicable to [text generation models](../models/generative_models.md) with a [chat template](../serving/openai_compatible_server.md#chat-template).
     - *Note: `user` parameter is ignored.*
@@ -56,6 +58,8 @@ We currently support the following OpenAI APIs:
 - [Transcriptions API](#transcriptions-api) (`/v1/audio/transcriptions`)
     - Only applicable to [Automatic Speech Recognition (ASR) models](../models/supported_models.md#transcription).
 - [Translation API](#translations-api) (`/v1/audio/translations`)
+    - Only applicable to [Automatic Speech Recognition (ASR) models](../models/supported_models.md#transcription).
+- [Realtime API](#realtime-api) (`/v1/realtime`)
     - Only applicable to [Automatic Speech Recognition (ASR) models](../models/supported_models.md#transcription).
 
 In addition, we have the following custom APIs:
@@ -68,6 +72,9 @@ In addition, we have the following custom APIs:
     - Only applicable to [classification models](../models/pooling_models.md).
 - [Score API](#score-api) (`/score`)
     - Applicable to [embedding models and cross-encoder models](../models/pooling_models.md).
+- [Cohere Embed API](#cohere-embed-api) (`/v2/embed`)
+    - Compatible with [Cohere's Embed API](https://docs.cohere.com/reference/embed)
+    - Works with any [embedding model](../models/pooling_models.md), including multimodal models.
 - [Re-rank API](#re-rank-api) (`/rerank`, `/v1/rerank`, `/v2/rerank`)
     - Implements [Jina AI's v1 re-rank API](https://jina.ai/reranker/)
     - Also compatible with [Cohere's v1 & v2 re-rank APIs](https://docs.cohere.com/v2/reference/rerank)
@@ -80,7 +87,7 @@ In order for the language model to support chat protocol, vLLM requires the mode
 a chat template in its tokenizer configuration. The chat template is a Jinja2 template that
 specifies how roles, messages, and other chat-specific tokens are encoded in the input.
 
-An example chat template for `NousResearch/Meta-Llama-3-8B-Instruct` can be found [here](https://github.com/meta-llama/llama3?tab=readme-ov-file#instruction-tuned-models)
+An example chat template for `NousResearch/Meta-Llama-3-8B-Instruct` can be found [here](https://llama.com/docs/model-cards-and-prompt-formats/meta-llama-3/#prompt-template-for-meta-llama-3)
 
 Some models do not provide a chat template even though they are instruction/chat fine-tuned. For those models,
 you can manually specify their chat template in the `--chat-template` parameter with the file path to the chat
@@ -171,6 +178,14 @@ with `--enable-request-id-headers`.
     print(completion._request_id)
     ```
 
+## Offline API Documentation
+
+The FastAPI `/docs` endpoint requires an internet connection by default. To enable offline access in air-gapped environments, use the `--enable-offline-docs` flag:
+
+```bash
+vllm serve NousResearch/Meta-Llama-3-8B-Instruct --enable-offline-docs
+```
+
 ## API Reference
 
 ### Completions API
@@ -178,7 +193,7 @@ with `--enable-request-id-headers`.
 Our Completions API is compatible with [OpenAI's Completions API](https://platform.openai.com/docs/api-reference/completions);
 you can use the [official OpenAI Python client](https://github.com/openai/openai-python) to interact with it.
 
-Code example: [examples/online_serving/openai_completion_client.py](../../examples/online_serving/openai_completion_client.py)
+Code example: [examples/basic/online_serving/openai_completion_client.py](../../examples/basic/online_serving/openai_completion_client.py)
 
 #### Extra parameters
 
@@ -187,7 +202,7 @@ The following [sampling parameters](../api/README.md#inference-parameters) are s
 ??? code
 
     ```python
-    --8<-- "vllm/entrypoints/openai/protocol.py:completion-sampling-params"
+    --8<-- "vllm/entrypoints/openai/completion/protocol.py:completion-sampling-params"
     ```
 
 The following extra parameters are supported:
@@ -195,7 +210,7 @@ The following extra parameters are supported:
 ??? code
 
     ```python
-    --8<-- "vllm/entrypoints/openai/protocol.py:completion-extra-params"
+    --8<-- "vllm/entrypoints/openai/completion/protocol.py:completion-extra-params"
     ```
 
 ### Chat API
@@ -209,7 +224,7 @@ see our [Multimodal Inputs](../features/multimodal_inputs.md) guide for more inf
 
 - *Note: `image_url.detail` parameter is not supported.*
 
-Code example: [examples/online_serving/openai_chat_completion_client.py](../../examples/online_serving/openai_chat_completion_client.py)
+Code example: [examples/basic/online_serving/openai_chat_completion_client.py](../../examples/basic/online_serving/openai_chat_completion_client.py)
 
 #### Extra parameters
 
@@ -218,7 +233,7 @@ The following [sampling parameters](../api/README.md#inference-parameters) are s
 ??? code
 
     ```python
-    --8<-- "vllm/entrypoints/openai/protocol.py:chat-completion-sampling-params"
+    --8<-- "vllm/entrypoints/openai/chat_completion/protocol.py:chat-completion-sampling-params"
     ```
 
 The following extra parameters are supported:
@@ -226,7 +241,32 @@ The following extra parameters are supported:
 ??? code
 
     ```python
-    --8<-- "vllm/entrypoints/openai/protocol.py:chat-completion-extra-params"
+    --8<-- "vllm/entrypoints/openai/chat_completion/protocol.py:chat-completion-extra-params"
+    ```
+
+### Responses API
+
+Our Responses API is compatible with [OpenAI's Responses API](https://platform.openai.com/docs/api-reference/responses);
+you can use the [official OpenAI Python client](https://github.com/openai/openai-python) to interact with it.
+
+Code example: [examples/online_serving/openai_responses_client_with_tools.py](../../examples/online_serving/openai_responses_client_with_tools.py)
+
+#### Extra parameters
+
+The following extra parameters in the request object are supported:
+
+??? code
+
+    ```python
+    --8<-- "vllm/entrypoints/openai/responses/protocol.py:responses-extra-params"
+    ```
+
+The following extra parameters in the response object are supported:
+
+??? code
+
+    ```python
+    --8<-- "vllm/entrypoints/openai/responses/protocol.py:responses-response-extra-params"
     ```
 
 ### Embeddings API
@@ -274,7 +314,7 @@ and passing a list of `messages` in the request. Refer to the examples below for
     vllm serve TIGER-Lab/VLM2Vec-Full --runner pooling \
       --trust-remote-code \
       --max-model-len 4096 \
-      --chat-template examples/template_vlm2vec_phi3v.jinja
+      --chat-template examples/pooling/embed/template/vlm2vec_phi3v.jinja
     ```
 
     !!! important
@@ -282,7 +322,7 @@ and passing a list of `messages` in the request. Refer to the examples below for
         to run this model in embedding mode instead of text generation mode.
 
         The custom chat template is completely different from the original one for this model,
-        and can be found here: [examples/template_vlm2vec_phi3v.jinja](../../examples/template_vlm2vec_phi3v.jinja)
+        and can be found here: [examples/pooling/embed/template/vlm2vec_phi3v.jinja](../../examples/pooling/embed/template/vlm2vec_phi3v.jinja)
 
     Since the request schema is not defined by OpenAI client, we post a request to the server using the lower-level `requests` library:
 
@@ -322,20 +362,20 @@ and passing a list of `messages` in the request. Refer to the examples below for
     vllm serve MrLight/dse-qwen2-2b-mrl-v1 --runner pooling \
       --trust-remote-code \
       --max-model-len 8192 \
-      --chat-template examples/template_dse_qwen2_vl.jinja
+      --chat-template examples/pooling/embed/template/dse_qwen2_vl.jinja
     ```
 
     !!! important
         Like with VLM2Vec, we have to explicitly pass `--runner pooling`.
 
         Additionally, `MrLight/dse-qwen2-2b-mrl-v1` requires an EOS token for embeddings, which is handled
-        by a custom chat template: [examples/template_dse_qwen2_vl.jinja](../../examples/template_dse_qwen2_vl.jinja)
+        by a custom chat template: [examples/pooling/embed/template/dse_qwen2_vl.jinja](../../examples/pooling/embed/template/dse_qwen2_vl.jinja)
 
     !!! important
         `MrLight/dse-qwen2-2b-mrl-v1` requires a placeholder image of the minimum image size for text query embeddings. See the full code
         example below for details.
 
-Full example: [examples/pooling/embed/openai_chat_embedding_client_for_multimodal.py](../../examples/pooling/embed/openai_chat_embedding_client_for_multimodal.py)
+Full example: [examples/pooling/embed/vision_embedding_online.py](../../examples/pooling/embed/vision_embedding_online.py)
 
 #### Extra parameters
 
@@ -343,24 +383,185 @@ The following [pooling parameters][vllm.PoolingParams] are supported.
 
 ```python
 --8<-- "vllm/pooling_params.py:common-pooling-params"
---8<-- "vllm/pooling_params.py:embedding-pooling-params"
+--8<-- "vllm/pooling_params.py:embed-pooling-params"
 ```
 
-The following extra parameters are supported by default:
+The following Embeddings API parameters are supported:
 
 ??? code
 
     ```python
-    --8<-- "vllm/entrypoints/pooling/embed/protocol.py:embedding-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:completion-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:encoding-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:embed-params"
     ```
 
-For chat-like input (i.e. if `messages` is passed), these extra parameters are supported instead:
+The following extra parameters are supported:
 
 ??? code
 
     ```python
-    --8<-- "vllm/entrypoints/pooling/embed/protocol.py:chat-embedding-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:completion-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:encoding-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:embed-extra-params"
     ```
+
+For chat-like input (i.e. if `messages` is passed), the following parameters are supported:
+
+The following parameters are supported by default:
+
+??? code
+
+    ```python
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:chat-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:encoding-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:embed-params"
+    ```
+
+these extra parameters are supported instead:
+
+??? code
+
+    ```python
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:chat-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:encoding-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:embed-extra-params"
+    ```
+
+### Cohere Embed API
+
+Our API is also compatible with [Cohere's Embed v2 API](https://docs.cohere.com/reference/embed) which adds support for some modern embedding feature such as truncation, output dimensions, embedding types, and input types. This endpoint works with any embedding model (including multimodal models).
+
+#### Cohere Embed API request parameters
+
+| Parameter | Type | Required | Description |
+| --------- | ---- | -------- | ----------- |
+| `model` | string | Yes | Model name |
+| `input_type` | string | No | Prompt prefix key (model-dependent, see below) |
+| `texts` | list[string] | No | Text inputs (use one of `texts`, `images`, or `inputs`) |
+| `images` | list[string] | No | Base64 data URI images |
+| `inputs` | list[object] | No | Mixed text and image content objects |
+| `embedding_types` | list[string] | No | Output types (default: `["float"]`) |
+| `output_dimension` | int | No | Truncate embeddings to this dimension (Matryoshka) |
+| `truncate` | string | No | `END`, `START`, or `NONE` (default: `END`) |
+
+#### Text embedding
+
+```bash
+curl -X POST "http://localhost:8000/v2/embed" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Snowflake/snowflake-arctic-embed-m-v1.5",
+    "input_type": "query",
+    "texts": ["Hello world", "How are you?"],
+    "embedding_types": ["float"]
+  }'
+```
+
+??? console "Response"
+
+    ```json
+    {
+      "id": "embd-...",
+      "embeddings": {
+        "float": [
+          [0.012, -0.034, ...],
+          [0.056, 0.078, ...]
+        ]
+      },
+      "texts": ["Hello world", "How are you?"],
+      "meta": {
+        "api_version": {"version": "2"},
+        "billed_units": {"input_tokens": 12}
+      }
+    }
+    ```
+
+#### Mixed text and image inputs
+
+For multimodal models, you can embed images by passing base64 data URIs. The `inputs` field accepts a list of objects with mixed text and image content:
+
+```bash
+curl -X POST "http://localhost:8000/v2/embed" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "google/siglip-so400m-patch14-384",
+    "inputs": [
+      {
+        "content": [
+          {"type": "text", "text": "A photo of a cat"},
+          {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR..."}}
+        ]
+      }
+    ],
+    "embedding_types": ["float"]
+  }'
+```
+
+#### Embedding types
+
+The `embedding_types` parameter controls the output format. Multiple types can be requested in a single call:
+
+| Type | Description |
+| ---- | ----------- |
+| `float` | Raw float32 embeddings (default) |
+| `binary` | Bit-packed signed binary |
+| `ubinary` | Bit-packed unsigned binary |
+| `base64` | Little-endian float32 encoded as base64 |
+
+```bash
+curl -X POST "http://localhost:8000/v2/embed" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Snowflake/snowflake-arctic-embed-m-v1.5",
+    "input_type": "query",
+    "texts": ["What is machine learning?"],
+    "embedding_types": ["float", "binary"]
+  }'
+```
+
+??? console "Response"
+
+    ```json
+    {
+      "id": "embd-...",
+      "embeddings": {
+        "float": [[0.012, -0.034, ...]],
+        "binary": [[42, -117, ...]]
+      },
+      "texts": ["What is machine learning?"],
+      "meta": {
+        "api_version": {"version": "2"},
+        "billed_units": {"input_tokens": 8}
+      }
+    }
+    ```
+
+#### Truncation
+
+The `truncate` parameter controls how inputs exceeding the model's maximum sequence length are handled:
+
+| Value | Behavior |
+| ----- | --------- |
+| `END` (default) | Keep the first tokens, drop the end |
+| `START` | Keep the last tokens, drop the beginning |
+| `NONE` | Return an error if the input is too long |
+
+#### Input type and prompt prefixes
+
+The `input_type` field selects a prompt prefix to prepend to each text input. The available values
+depend on the model:
+
+- **Models with `task_instructions` in `config.json`**: The keys from the `task_instructions` dict are
+  the valid `input_type` values and the corresponding value is prepended to each text.
+- **Models with `config_sentence_transformers.json` prompts**: The keys from the `prompts` dict are
+  the valid `input_type` values. For example, `Snowflake/snowflake-arctic-embed-xs` defines `"query"`,
+  so setting `input_type: "query"` prepends `"Represent this sentence for searching relevant passages: "`.
+- **Other models**: `input_type` is not accepted and will raise a validation error if passed.
 
 ### Transcriptions API
 
@@ -371,6 +572,8 @@ you can use the [official OpenAI Python client](https://github.com/openai/openai
     To use the Transcriptions API, please install with extra audio dependencies using `pip install vllm[audio]`.
 
 Code example: [examples/online_serving/openai_transcription_client.py](../../examples/online_serving/openai_transcription_client.py)
+
+NOTE: beam search is currently supported in the transcriptions endpoint for encoder-decoder multimodal models, e.g., whisper, but highly inefficient as work for handling the encoder/decoder cache is actively ongoing. This is an active point of ongoing optimization and will be handled properly in the very near future.
 
 #### API Enforced Limits
 
@@ -456,7 +659,7 @@ For `verbose_json` response format:
       ]
     }
     ```
-Currently “verbose_json” response format doesn’t support avg_logprob, compression_ratio, no_speech_prob.
+Currently “verbose_json” response format doesn’t support no_speech_prob.
 
 #### Extra Parameters
 
@@ -465,7 +668,7 @@ The following [sampling parameters](../api/README.md#inference-parameters) are s
 ??? code
 
     ```python
-    --8<-- "vllm/entrypoints/openai/protocol.py:transcription-sampling-params"
+    --8<-- "vllm/entrypoints/openai/speech_to_text/protocol.py:transcription-sampling-params"
     ```
 
 The following extra parameters are supported:
@@ -473,7 +676,7 @@ The following extra parameters are supported:
 ??? code
 
     ```python
-    --8<-- "vllm/entrypoints/openai/protocol.py:transcription-extra-params"
+    --8<-- "vllm/entrypoints/openai/speech_to_text/protocol.py:transcription-extra-params"
     ```
 
 ### Translations API
@@ -493,14 +696,60 @@ Code example: [examples/online_serving/openai_translation_client.py](../../examp
 The following [sampling parameters](../api/README.md#inference-parameters) are supported.
 
 ```python
---8<-- "vllm/entrypoints/openai/protocol.py:translation-sampling-params"
+--8<-- "vllm/entrypoints/openai/speech_to_text/protocol.py:translation-sampling-params"
 ```
 
 The following extra parameters are supported:
 
 ```python
---8<-- "vllm/entrypoints/openai/protocol.py:translation-extra-params"
+--8<-- "vllm/entrypoints/openai/speech_to_text/protocol.py:translation-extra-params"
 ```
+
+### Realtime API
+
+The Realtime API provides WebSocket-based streaming audio transcription, allowing real-time speech-to-text as audio is being recorded.
+
+!!! note
+    To use the Realtime API, please install with extra audio dependencies using `uv pip install vllm[audio]`.
+
+#### Audio Format
+
+Audio must be sent as base64-encoded PCM16 audio at 16kHz sample rate, mono channel.
+
+#### Protocol Overview
+
+1. Client connects to `ws://host/v1/realtime`
+2. Server sends `session.created` event
+3. Client optionally sends `session.update` with model/params
+4. Client sends `input_audio_buffer.commit` when ready
+5. Client sends `input_audio_buffer.append` events with base64 PCM16 chunks
+6. Server sends `transcription.delta` events with incremental text
+7. Server sends `transcription.done` with final text + usage
+8. Repeat from step 5 for next utterance
+9. Optionally, client sends input_audio_buffer.commit with final=True
+    to signal audio input is finished. Useful when streaming audio files
+
+#### Client → Server Events
+
+| Event | Description |
+| ----- | ----------- |
+| `input_audio_buffer.append` | Send base64-encoded audio chunk: `{"type": "input_audio_buffer.append", "audio": "<base64>"}` |
+| `input_audio_buffer.commit` | Trigger transcription processing or end: `{"type": "input_audio_buffer.commit", "final": bool}` |
+| `session.update` | Configure session: `{"type": "session.update", "model": "model-name"}` |
+
+#### Server → Client Events
+
+| Event | Description |
+| ----- | ----------- |
+| `session.created` | Connection established with session ID and timestamp |
+| `transcription.delta` | Incremental transcription text: `{"type": "transcription.delta", "delta": "text"}` |
+| `transcription.done` | Final transcription with usage stats |
+| `error` | Error notification with message and optional code |
+
+#### Example Clients
+
+- [openai_realtime_client.py](https://github.com/vllm-project/vllm/tree/main/examples/online_serving/openai_realtime_client.py) - Upload and transcribe an audio file
+- [openai_realtime_microphone_client.py](https://github.com/vllm-project/vllm/tree/main/examples/online_serving/openai_realtime_microphone_client.py) - Gradio demo for live microphone transcription
 
 ### Tokenizer API
 
@@ -516,7 +765,7 @@ Our Pooling API encodes input prompts using a [pooling model](../models/pooling_
 
 The input format is the same as [Embeddings API](#embeddings-api), but the output data can contain an arbitrary nested list, not just a 1-D list of floats.
 
-Code example: [examples/pooling/pooling/openai_pooling_client.py](../../examples/pooling/pooling/openai_pooling_client.py)
+Code example: [examples/pooling/pooling/pooling_online.py](../../examples/pooling/pooling/pooling_online.py)
 
 ### Classification API
 
@@ -524,7 +773,7 @@ Our Classification API directly supports Hugging Face sequence-classification mo
 
 We automatically wrap any other transformer via `as_seq_cls_model()`, which pools on the last token, attaches a `RowParallelLinear` head, and applies a softmax to produce per-class probabilities.
 
-Code example: [examples/pooling/classify/openai_classification_client.py](../../examples/pooling/classify/openai_classification_client.py)
+Code example: [examples/pooling/classify/classification_online.py](../../examples/pooling/classify/classification_online.py)
 
 #### Example Requests
 
@@ -624,14 +873,48 @@ The following [pooling parameters][vllm.PoolingParams] are supported.
 
 ```python
 --8<-- "vllm/pooling_params.py:common-pooling-params"
---8<-- "vllm/pooling_params.py:classification-pooling-params"
+--8<-- "vllm/pooling_params.py:classify-pooling-params"
 ```
+
+The following Classification API parameters are supported:
+
+??? code
+
+    ```python
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:completion-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:classify-params"
+    ```
 
 The following extra parameters are supported:
 
-```python
---8<-- "vllm/entrypoints/pooling/classify/protocol.py:classification-extra-params"
-```
+??? code
+
+    ```python
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:completion-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:classify-extra-params"
+    ```
+
+For chat-like input (i.e. if `messages` is passed), the following parameters are supported:
+
+??? code
+
+    ```python
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:chat-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:classify-params"
+    ```
+
+these extra parameters are supported instead:
+
+??? code
+
+    ```python
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:chat-extra-params"
+    --8<-- "vllm/entrypoints/pooling/base/protocol.py:classify-extra-params"
+    ```
 
 ### Score API
 
@@ -640,11 +923,26 @@ Usually, the score for a sentence pair refers to the similarity between two sent
 
 You can find the documentation for cross encoder models at [sbert.net](https://www.sbert.net/docs/package_reference/cross_encoder/cross_encoder.html).
 
-Code example: [examples/pooling/score/openai_cross_encoder_score.py](../../examples/pooling/score/openai_cross_encoder_score.py)
+Code example: [examples/pooling/score/score_api_online.py](../../examples/pooling/score/score_api_online.py)
+
+#### Score Template
+
+Some scoring models require a specific prompt format to work correctly. You can specify a custom score template using the `--chat-template` parameter (see [Chat Template](#chat-template)).
+
+Score templates are supported for **cross-encoder** models only. If you are using an **embedding** model for scoring, vLLM does not apply a score template.
+
+Like chat templates, the score template receives a `messages` list. For scoring, each message has a `role` attribute—either `"query"` or `"document"`. For the usual kind of point-wise cross-encoder, you can expect exactly two messages: one query and one document. To access the query and document content, use Jinja's `selectattr` filter:
+
+- **Query**: `{{ (messages | selectattr("role", "eq", "query") | first).content }}`
+- **Document**: `{{ (messages | selectattr("role", "eq", "document") | first).content }}`
+
+This approach is more robust than index-based access (`messages[0]`, `messages[1]`) because it selects messages by their semantic role. It also avoids assumptions about message ordering if additional message types are added to `messages` in the future.
+
+Example template file: [examples/pooling/score/template/nemotron-rerank.jinja](../../examples/pooling/score/template/nemotron-rerank.jinja)
 
 #### Single inference
 
-You can pass a string to both `text_1` and `text_2`, forming a single sentence pair.
+You can pass a string to both `queries` and `documents`, forming a single sentence pair.
 
 ```bash
 curl -X 'POST' \
@@ -654,8 +952,8 @@ curl -X 'POST' \
   -d '{
   "model": "BAAI/bge-reranker-v2-m3",
   "encoding_format": "float",
-  "text_1": "What is the capital of France?",
-  "text_2": "The capital of France is Paris."
+  "queries": "What is the capital of France?",
+  "documents": "The capital of France is Paris."
 }'
 ```
 
@@ -680,9 +978,9 @@ curl -X 'POST' \
 
 #### Batch inference
 
-You can pass a string to `text_1` and a list to `text_2`, forming multiple sentence pairs
-where each pair is built from `text_1` and a string in `text_2`.
-The total number of pairs is `len(text_2)`.
+You can pass a string to `queries` and a list to `documents`, forming multiple sentence pairs
+where each pair is built from `queries` and a string in `documents`.
+The total number of pairs is `len(documents)`.
 
 ??? console "Request"
 
@@ -693,8 +991,8 @@ The total number of pairs is `len(text_2)`.
       -H 'Content-Type: application/json' \
       -d '{
       "model": "BAAI/bge-reranker-v2-m3",
-      "text_1": "What is the capital of France?",
-      "text_2": [
+      "queries": "What is the capital of France?",
+      "documents": [
         "The capital of Brazil is Brasilia.",
         "The capital of France is Paris."
       ]
@@ -725,9 +1023,9 @@ The total number of pairs is `len(text_2)`.
     }
     ```
 
-You can pass a list to both `text_1` and `text_2`, forming multiple sentence pairs
-where each pair is built from a string in `text_1` and the corresponding string in `text_2` (similar to `zip()`).
-The total number of pairs is `len(text_2)`.
+You can pass a list to both `queries` and `documents`, forming multiple sentence pairs
+where each pair is built from a string in `queries` and the corresponding string in `documents` (similar to `zip()`).
+The total number of pairs is `len(documents)`.
 
 ??? console "Request"
 
@@ -739,11 +1037,11 @@ The total number of pairs is `len(text_2)`.
       -d '{
       "model": "BAAI/bge-reranker-v2-m3",
       "encoding_format": "float",
-      "text_1": [
+      "queries": [
         "What is the capital of Brazil?",
         "What is the capital of France?"
       ],
-      "text_2": [
+      "documents": [
         "The capital of Brazil is Brasilia.",
         "The capital of France is Paris."
       ]
@@ -792,28 +1090,34 @@ You can pass multi-modal inputs to scoring models by passing `content` including
 
         ```python
         import requests
-
+        
         response = requests.post(
             "http://localhost:8000/v1/score",
             json={
                 "model": "jinaai/jina-reranker-m0",
-                "text_1": "slm markdown",
-                "text_2": {
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": "https://raw.githubusercontent.com/jina-ai/multimodal-reranker-test/main/handelsblatt-preview.png"
-                            },
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": "https://raw.githubusercontent.com/jina-ai/multimodal-reranker-test/main/paper-11.png"
-                            },
-                        },
-                    ],
-                },
+                "queries": "slm markdown",
+                "documents": [
+                    {
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://raw.githubusercontent.com/jina-ai/multimodal-reranker-test/main/handelsblatt-preview.png"
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": "https://raw.githubusercontent.com/jina-ai/multimodal-reranker-test/main/handelsblatt-preview.png"
+                                },
+                            }
+                        ]
+                    },
+                ],
             },
         )
         response.raise_for_status()
@@ -821,7 +1125,10 @@ You can pass multi-modal inputs to scoring models by passing `content` including
         print("Scoring output:", response_json["data"][0]["score"])
         print("Scoring output:", response_json["data"][1]["score"])
         ```
-Full example: [examples/pooling/score/openai_cross_encoder_score_for_multimodal.py](../../examples/pooling/score/openai_cross_encoder_score_for_multimodal.py)
+Full example:
+
+- [examples/pooling/score/vision_score_api_online.py](../../examples/pooling/score/vision_score_api_online.py)
+- [examples/pooling/score/vision_rerank_api_online.py](../../examples/pooling/score/vision_rerank_api_online.py)
 
 #### Extra parameters
 
@@ -829,13 +1136,20 @@ The following [pooling parameters][vllm.PoolingParams] are supported.
 
 ```python
 --8<-- "vllm/pooling_params.py:common-pooling-params"
---8<-- "vllm/pooling_params.py:classification-pooling-params"
+--8<-- "vllm/pooling_params.py:classify-pooling-params"
+```
+
+The following Score API parameters are supported:
+
+```python
+--8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-params"
 ```
 
 The following extra parameters are supported:
 
 ```python
---8<-- "vllm/entrypoints/pooling/score/protocol.py:score-extra-params"
+--8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-extra-params"
+--8<-- "vllm/entrypoints/pooling/base/protocol.py:classify-extra-params"
 ```
 
 ### Re-rank API
@@ -851,7 +1165,7 @@ endpoints are compatible with both [Jina AI's re-rank API interface](https://jin
 [Cohere's re-rank API interface](https://docs.cohere.com/v2/reference/rerank) to ensure compatibility with
 popular open-source tools.
 
-Code example: [examples/pooling/score/jinaai_rerank_client.py](../../examples/pooling/score/jinaai_rerank_client.py)
+Code example: [examples/pooling/score/rerank_api_online.py](../../examples/pooling/score/rerank_api_online.py)
 
 #### Example Request
 
@@ -910,13 +1224,21 @@ The following [pooling parameters][vllm.PoolingParams] are supported.
 
 ```python
 --8<-- "vllm/pooling_params.py:common-pooling-params"
---8<-- "vllm/pooling_params.py:classification-pooling-params"
+--8<-- "vllm/pooling_params.py:classify-pooling-params"
+```
+
+The following Re-rank API parameters are supported:
+
+```python
+--8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-params"
+--8<-- "vllm/entrypoints/pooling/base/protocol.py:classify-extra-params"
 ```
 
 The following extra parameters are supported:
 
 ```python
---8<-- "vllm/entrypoints/pooling/score/protocol.py:rerank-extra-params"
+--8<-- "vllm/entrypoints/pooling/base/protocol.py:pooling-common-extra-params"
+--8<-- "vllm/entrypoints/pooling/base/protocol.py:classify-extra-params"
 ```
 
 ## Ray Serve LLM
@@ -931,4 +1253,4 @@ Key capabilities:
 
 The following example shows how to deploy a large model like DeepSeek R1 with Ray Serve LLM: [examples/online_serving/ray_serve_deepseek.py](../../examples/online_serving/ray_serve_deepseek.py).
 
-Learn more about Ray Serve LLM with the official [Ray Serve LLM documentation](https://docs.ray.io/en/latest/serve/llm/serving-llms.html).
+Learn more about Ray Serve LLM with the official [Ray Serve LLM documentation](https://docs.ray.io/en/latest/serve/llm/index.html).
